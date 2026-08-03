@@ -1,6 +1,7 @@
 (() => {
   'use strict';
 
+  const SOURCE_BRANCH = 'test';
   const byId = (id) => document.getElementById(id);
 
   function cleanVersion(value) {
@@ -54,7 +55,7 @@
         current
           ? (
             revisionLabel
-              ? `v${current} · main ${revisionLabel}`
+              ? `v${current} · ${SOURCE_BRANCH} ${revisionLabel}`
               : `v${current}`
           )
           : '—'
@@ -62,7 +63,7 @@
 
       currentElement.title = (
         revisionLabel
-          ? `Installed version ${current || 'unknown'}, main revision ${revisionLabel}`
+          ? `Installed version ${current || 'unknown'}, ${SOURCE_BRANCH} revision ${revisionLabel}`
           : `Installed version ${current || 'unknown'}`
       );
     }
@@ -94,12 +95,12 @@
 
       if (card) {
         card.dataset.updateAvailable = '1';
-        card.dataset.target = 'main';
+        card.dataset.target = String(payload?.target || SOURCE_BRANCH);
         card.dataset.latestRevision = latestRevision;
         card.setAttribute(
           'aria-label',
           latestRevision
-            ? `WG Panel update available, main revision ${latestRevision}`
+            ? `WG Panel update available, ${SOURCE_BRANCH} revision ${latestRevision}`
             : 'WG Panel update available'
         );
       }
@@ -124,7 +125,7 @@
 
     if (card) {
       card.dataset.updateAvailable = '0';
-      card.dataset.target = 'main';
+      card.dataset.target = String(payload?.target || SOURCE_BRANCH);
       card.dataset.latestRevision = latestRevision;
       card.setAttribute(
         'aria-label',
@@ -172,7 +173,7 @@
 
     if (hintElement) {
       hintElement.textContent = (
-        'Could not check GitHub main'
+        `Could not check GitHub ${SOURCE_BRANCH}`
       );
 
       hintElement.title = String(
@@ -252,7 +253,7 @@
 
     if (hintElement) {
       hintElement.textContent = (
-        'Checking GitHub main…'
+        `Checking GitHub ${SOURCE_BRANCH}…`
       );
 
       hintElement.removeAttribute(
@@ -343,11 +344,11 @@
     if (noteElement) {
       if (available) {
         noteElement.textContent = latestRevision
-          ? `New main revision · ${latestRevision}`
-          : 'New main revision available';
+          ? `New ${SOURCE_BRANCH} revision · ${latestRevision}`
+          : `New ${SOURCE_BRANCH} revision available`;
       } else {
         noteElement.textContent = currentRevision
-          ? `Main revision · ${currentRevision}`
+          ? `${SOURCE_BRANCH} revision · ${currentRevision}`
           : 'Repository is current';
       }
     }
@@ -357,7 +358,7 @@
     }
 
     card.dataset.updateAvailable = available ? '1' : '0';
-    card.dataset.target = 'main';
+    card.dataset.target = String(payload?.target || SOURCE_BRANCH);
   }
 
   function renderDashboardFailure(error) {
@@ -378,7 +379,7 @@
     }
 
     if (noteElement) {
-      noteElement.textContent = 'Could not check GitHub main';
+      noteElement.textContent = `Could not check GitHub ${SOURCE_BRANCH}`;
       noteElement.title = String(
         error?.message
         || error
@@ -406,7 +407,7 @@
     }
 
     if (noteElement) {
-      noteElement.textContent = 'Checking GitHub main…';
+      noteElement.textContent = `Checking GitHub ${SOURCE_BRANCH}…`;
       noteElement.removeAttribute('title');
     }
 

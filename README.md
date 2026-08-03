@@ -218,7 +218,7 @@ client.example.com:51820
 <div dir="ltr" align="left">
 
 ```
-sudo bash -c 'command -v curl >/dev/null 2>&1 || (apt-get update -y && apt-get install -y curl ca-certificates); bash -c "$(curl -fsSL https://raw.githubusercontent.com/Azumi67/WG_Panel/refs/heads/main/wg.sh)"'
+sudo bash -c 'command -v curl >/dev/null 2>&1 || (apt-get update -y && apt-get install -y curl ca-certificates); bash -c "$(curl -fsSL https://raw.githubusercontent.com/sam-soofy/WG_Panel/refs/heads/test/wg.sh)"'
 ```
 
 </div>
@@ -246,7 +246,10 @@ wgpanel
 <div dir="ltr" align="left">
 
 ```
-sudo bash -c 'command -v curl >/dev/null 2>&1 || (apt-get update -y && apt-get install -y curl ca-certificates); bash -c "$(curl -fsSL https://raw.githubusercontent.com/Azumi67/WG_Panel/refs/heads/main/agent/node.sh)"'
+apt-get update -y && apt-get install -y git curl ca-certificates
+git clone --depth 1 --branch test https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-test
+cd /opt/WG_Panel-test/agent
+sudo bash ./node.sh
 ```
 
 </div>

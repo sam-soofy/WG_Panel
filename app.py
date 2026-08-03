@@ -90,7 +90,8 @@ def _project_version() -> str:
 
 
 PANEL_VERSION = _project_version()
-PANEL_REPO = "Azumi67/WG_Panel"
+PANEL_REPO = "sam-soofy/WG_Panel"
+PANEL_BRANCH = "test"
 PANEL_UPDATE_TTL = 1800
 _PANEL_UPDATE_CACHE = {
     "ts": 0,
@@ -612,7 +613,13 @@ app.config.update(
 @app.context_processor
 def inject_nav_flags():
     v = set(current_app.view_functions.keys())
-    return {'HAS_NODES': 'nodes' in v, 'HAS_SETTINGS': 'settings_page' in v}
+    return {
+        'HAS_NODES': 'nodes' in v,
+        'HAS_SETTINGS': 'settings_page' in v,
+        'PANEL_REPO_URL': (
+            f"https://github.com/{PANEL_REPO}/tree/{PANEL_BRANCH}"
+        ),
+    }
 
 
 #--------------------------
@@ -1359,7 +1366,7 @@ def _github_latest_panel_version():
         response = requests.get(
             (
                 f"https://api.github.com/repos/"
-                f"{PANEL_REPO}/commits/main"
+                f"{PANEL_REPO}/commits/{PANEL_BRANCH}"
             ),
             headers=headers,
             timeout=8,
@@ -1389,7 +1396,8 @@ def _github_latest_panel_version():
 
     except Exception as exc:
         logging.getLogger(__name__).warning(
-            "Could not read GitHub main commit: %s",
+            "Could not read GitHub %s commit: %s",
+            PANEL_BRANCH,
             exc,
         )
 
@@ -1397,7 +1405,7 @@ def _github_latest_panel_version():
         response = requests.get(
             (
                 f"https://raw.githubusercontent.com/"
-                f"{PANEL_REPO}/main/VERSION"
+                f"{PANEL_REPO}/{PANEL_BRANCH}/VERSION"
             ),
             headers=headers,
             timeout=6,
@@ -1425,12 +1433,12 @@ def _github_latest_panel_version():
 
     return {
         "version": remote_version,
-        "target": "main",
+        "target": PANEL_BRANCH,
         "url": (
             commit_url
             or f"https://github.com/{PANEL_REPO}"
         ),
-        "source": "main",
+        "source": PANEL_BRANCH,
         "revision": commit_sha,
         "revision_short": commit_sha[:8],
         "commit_date": commit_date,
@@ -1546,9 +1554,9 @@ def api_panel_version():
             or f"https://github.com/{PANEL_REPO}"
         ),
 
-        "source": "main",
-        "target": "main",
-        "update_source": "main",
+        "source": PANEL_BRANCH,
+        "target": PANEL_BRANCH,
+        "update_source": PANEL_BRANCH,
 
         "current_revision": (
             installed_revision
@@ -4554,7 +4562,7 @@ def api_panel_update_status():
 @require_api_key_or_login
 def api_panel_update_start():
     data = request.get_json(silent=True) or {}
-    target = "main"
+    target = PANEL_BRANCH
 
     try:
         status = _queue_safe_update(
@@ -4608,8 +4616,8 @@ def api_panel_update_targets():
             "version": {
                 "current": None,
                 "latest": latest_version,
-                "target": "main",
-                "source": "main",
+                "target": PANEL_BRANCH,
+                "source": PANEL_BRANCH,
 
                 "latest_revision": (
                     latest_revision
@@ -4674,8 +4682,8 @@ def api_panel_update_targets():
                     or None
                 ),
 
-                "target": "main",
-                "source": "main",
+                "target": PANEL_BRANCH,
+                "source": PANEL_BRANCH,
 
                 "current_revision": str(
                     version.get(
@@ -4739,8 +4747,8 @@ def api_panel_update_targets():
     return jsonify(
         ok=True,
         latest=latest_version,
-        target="main",
-        update_source="main",
+        target=PANEL_BRANCH,
+        update_source=PANEL_BRANCH,
 
         latest_revision=latest_revision,
         latest_revision_short=(
@@ -4760,7 +4768,7 @@ def api_node_update_start(nid):
         response = node_post(
            node,
            "/api/system/update",
-           {"target": "main"},
+           {"target": PANEL_BRANCH},
            timeout=12,
         )
         return jsonify(response if isinstance(response, dict) else {
@@ -5537,7 +5545,7 @@ def backup_node_agent_install_command():
             api_key = ''
         base_url = getattr(node, 'base_url', '') or ''
 
-    command = """sudo bash -c 'command -v curl >/dev/null 2>&1 || (apt-get update -y && apt-get install -y curl ca-certificates); bash -c "$(curl -fsSL https://raw.githubusercontent.com/Azumi67/WG_Panel/refs/heads/main/agent/node.sh)"'"""
+    command = """sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch test https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-test; cd /opt/WG_Panel-test/agent; bash ./node.sh'"""
 
     return jsonify(
         ok=True,

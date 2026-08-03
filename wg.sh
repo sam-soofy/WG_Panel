@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/venv}"
 PY="$VENV_DIR/bin/python"
 
-DEFAULT_WG_URL="https://raw.githubusercontent.com/Azumi67/WG_Panel/refs/heads/main/wg.py"
+DEFAULT_WG_URL="https://raw.githubusercontent.com/sam-soofy/WG_Panel/refs/heads/test/wg.py"
 
 APT_PKGS=(
   sudo
@@ -51,7 +51,7 @@ Options:
 Examples:
   sudo $0
   sudo $0 --force-fetch
-  sudo $0 https://raw.githubusercontent.com/Azumi67/WG_Panel/refs/heads/main/wg.py
+  sudo $0 https://raw.githubusercontent.com/sam-soofy/WG_Panel/refs/heads/test/wg.py
   sudo $0 -- --no-color
 EOF
 }
