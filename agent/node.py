@@ -221,8 +221,9 @@ def _action(title: str, fn):
 AGENT_DIR = Path(__file__).resolve().parent
 ROOT_MARKER = Path.home() / ".wg_node_root.json"
 
-DEFAULT_CLONE_DIR = Path("/usr/local/bin/wg_panel")
-DEFAULT_GIT_URL = "https://github.com/Azumi67/WG_Panel.git"
+DEFAULT_CLONE_DIR = Path("/usr/local/bin/wg_panel-test")
+DEFAULT_GIT_URL = "https://github.com/sam-soofy/WG_Panel.git"
+DEFAULT_GIT_BRANCH = "test"
 
 def _write(p: Path, text: str):
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1095,7 +1096,17 @@ def install_step_1():
 
     print(left_margin() + c(f"{TAG_RUN} ", BR_CYN) + c("git clone (quiet)", BR_WHT))
     p = subprocess.run(
-        ["git", "clone", "--depth", "1", "--quiet", url, str(dest_path)],
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            DEFAULT_GIT_BRANCH,
+            "--quiet",
+            url,
+            str(dest_path),
+        ],
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -1385,7 +1396,7 @@ def uninstall_all(root: Path):
     pause()
 
 
-RELEASES_API = "https://api.github.com/repos/Azumi67/WG_Panel/releases"
+RELEASES_API = "https://api.github.com/repos/sam-soofy/WG_Panel/releases"
 RELEASE_BACKUP_PREFIX = "release-rollback-"
 
 RELEASE_PRESERVE_TOP = {

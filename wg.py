@@ -73,8 +73,9 @@ TAG_ERR  = "[ERROR]"
 TAG_RUN  = "[RUN]"
 
 
-REPO_URL = "https://github.com/Azumi67/WG_Panel"
-REPO_DIRNAME_DEFAULT = "WG_Panel"
+REPO_URL = "https://github.com/sam-soofy/WG_Panel"
+REPO_BRANCH = "test"
+REPO_DIRNAME_DEFAULT = "WG_Panel-test"
 
 
 UI_MAX_WIDTH = 92
@@ -663,7 +664,17 @@ def clone_repo():
         pause()
         return
 
-    rc = _live(["git", "clone", REPO_URL, str(target)], "git clone")
+    rc = _live(
+        [
+            "git",
+            "clone",
+            "--branch",
+            REPO_BRANCH,
+            REPO_URL,
+            str(target),
+        ],
+        "git clone",
+    )
     if rc == 0 and (target / "app.py").exists():
         set_project(target)
         ok(f"Project root set: {_paths(str(target))}")
@@ -3236,7 +3247,7 @@ def _github_json(url: str, timeout: int = 20):
 def _github_panel_releases() -> List[dict]:
     data = _github_json(
         "https://api.github.com/repos/"
-        "Azumi67/WG_Panel/releases?per_page=40"
+        "sam-soofy/WG_Panel/releases?per_page=40"
     )
 
     if not isinstance(data, list):
@@ -3257,7 +3268,7 @@ def _github_panel_releases() -> List[dict]:
             continue
 
         zip_url = (
-            "https://github.com/Azumi67/WG_Panel/"
+            "https://github.com/sam-soofy/WG_Panel/"
             f"archive/refs/tags/{tag}.zip"
         )
 
@@ -3474,7 +3485,7 @@ def _extract_release_zip(
 
 def update_project(root: Path):
     """
-    Update WG Panel to the latest main-branch version.
+    Update WG Panel to the latest configured branch version.
 
     Update never shows a release/version list.
     """
@@ -3501,13 +3512,13 @@ def update_project(root: Path):
         return
 
     clear()
-    header("Update", "latest main branch")
+    header("Update", f"latest {REPO_BRANCH} branch")
 
     print(
         box(
             "Update Plan",
             [
-                "• Download the latest main branch.",
+                f"• Download the latest {REPO_BRANCH} branch.",
                 "• Preserve .env, instance, database, backups and venv.",
                 "• Refresh Python requirements.",
                 "• Validate app.py, telegram_bot.py and wg.py.",
@@ -3542,7 +3553,7 @@ def update_project(root: Path):
                 "--depth",
                 "1",
                 "--branch",
-                "main",
+                REPO_BRANCH,
                 REPO_URL,
                 str(source),
             ],
@@ -3552,7 +3563,7 @@ def update_project(root: Path):
 
         if rc != 0:
             raise RuntimeError(
-                "Could not download the latest main branch."
+                f"Could not download the latest {REPO_BRANCH} branch."
             )
 
         if not _sync_project_code(source, root):
@@ -4018,7 +4029,7 @@ def main_menu():
     while True:
         root = get_project()
         clear()
-        print(c("WG Panel Control", BR_WHT + BOLD) + "  " + c("Azumi67/WG_Panel", BR_CYN))
+        print(c("WG Panel Control", BR_WHT + BOLD) + "  " + c("sam-soofy/WG_Panel@test", BR_CYN))
         print(hr("═", BR_CYN))
         print(render_status(root))
         print()
@@ -4061,4 +4072,3 @@ if __name__ == "__main__":
     _wgpanel_command(root)
     preclone()
     main_menu()
-

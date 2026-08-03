@@ -1419,7 +1419,8 @@ def _node_version() -> str:
     return "0.0.0"
 
 
-NODE_REPO = "Azumi67/WG_Panel"
+NODE_REPO = "sam-soofy/WG_Panel"
+NODE_BRANCH = "test"
 
 def _node_root():
     configured = (os.getenv("WG_PANEL_ROOT") or "").strip()
@@ -1658,7 +1659,7 @@ def _node_latest_version():
         response = requests.get(
             (
                 f"https://api.github.com/repos/"
-                f"{NODE_REPO}/commits/main"
+                f"{NODE_REPO}/commits/{NODE_BRANCH}"
             ),
             headers=headers,
             timeout=8,
@@ -1688,7 +1689,8 @@ def _node_latest_version():
 
     except Exception as exc:
         app.logger.warning(
-            "Could not read GitHub main commit: %s",
+            "Could not read GitHub %s commit: %s",
+            NODE_BRANCH,
             exc,
         )
 
@@ -1696,7 +1698,7 @@ def _node_latest_version():
         response = requests.get(
             (
                 f"https://raw.githubusercontent.com/"
-                f"{NODE_REPO}/main/VERSION"
+                f"{NODE_REPO}/{NODE_BRANCH}/VERSION"
             ),
             headers=headers,
             timeout=6,
@@ -1721,8 +1723,8 @@ def _node_latest_version():
 
     return {
         "version": remote_version,
-        "target": "main",
-        "source": "main",
+        "target": NODE_BRANCH,
+        "source": NODE_BRANCH,
 
         "revision": commit_sha,
         "revision_short": (
@@ -1819,9 +1821,9 @@ def node_system_version():
 
         repo=NODE_REPO,
 
-        target="main",
-        source="main",
-        update_source="main",
+        target=NODE_BRANCH,
+        source=NODE_BRANCH,
+        update_source=NODE_BRANCH,
 
         current_revision=(
             installed_revision
@@ -1877,7 +1879,7 @@ def node_system_update_start():
         silent=True
     ) or {}
 
-    target = "main"
+    target = NODE_BRANCH
 
     root = _node_root()
 

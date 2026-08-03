@@ -668,9 +668,10 @@
       ? `v${String(version.latest).replace(/^v/i, '')}`
       : '';
 
+    const sourceBranch = String(version?.target || 'test');
     const latest = latestRevision
-      ? `main · ${latestRevision}`
-      : (latestVersion || 'main');
+      ? `${sourceBranch} · ${latestRevision}`
+      : (latestVersion || sourceBranch);
 
     setText('pu-local-current', current);
     setText('pu-local-latest', latest);
@@ -697,7 +698,7 @@
       button.dataset.target = String(
         version?.target
         || version?.latest
-        || 'main',
+        || 'test',
       );
     }
   }
@@ -751,9 +752,10 @@
         ? `v${String(version.latest).replace(/^v/i, '')}`
         : '';
 
+      const sourceBranch = String(version.target || 'test');
       const latest = latestRevision
-        ? `main · ${latestRevision}`
-        : (latestVersion || 'main');
+        ? `${sourceBranch} · ${latestRevision}`
+        : (latestVersion || sourceBranch);
 
       const available = (
         online
@@ -853,7 +855,7 @@
       button.dataset.target
       || state.localVersion?.target
       || state.localVersion?.latest
-      || 'main',
+      || 'test',
     );
 
     try {
@@ -891,7 +893,7 @@
     if (!button || button.disabled) return;
 
     const nodeId = button.dataset.nodeId;
-    const target = button.dataset.target || 'main';
+    const target = button.dataset.target || 'test';
 
     const accepted = await askConfirmation({
       title: 'Update remote node?',

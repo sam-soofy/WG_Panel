@@ -48,8 +48,8 @@ def run(cmd, cwd=None, timeout=1200, check=True):
         raise RuntimeError(f"{' '.join(map(str,cmd))} failed ({p.returncode}):\n{p.stdout[-4000:]}")
     return p
 
-def github_main_metadata(repo: str) -> dict:
-    """Resolve main revision without depending on GitHub REST API quota.
+def github_branch_metadata(repo: str, branch: str) -> dict:
+    """Resolve a branch revision without depending on GitHub REST API quota.
 
     `git ls-remote` is the primary source. The REST API is only a best-effort
     fallback and a 403/rate-limit response must never abort an otherwise valid
@@ -57,7 +57,7 @@ def github_main_metadata(repo: str) -> dict:
     """
     revision = ""
     commit_date = ""
-    url = f"https://github.com/{repo}/commits/main"
+    url = f"https://github.com/{repo}/commits/{branch}"
 
     git = shutil.which("git")
     if git:
@@ -67,7 +67,7 @@ def github_main_metadata(repo: str) -> dict:
                     git,
                     "ls-remote",
                     f"https://github.com/{repo}.git",
-                    "refs/heads/main",
+                    f"refs/heads/{branch}",
                 ],
                 timeout=45,
                 check=False,
@@ -97,7 +97,7 @@ def github_main_metadata(repo: str) -> dict:
 
         try:
             request = Request(
-                f"https://api.github.com/repos/{repo}/commits/main",
+                f"https://api.github.com/repos/{repo}/commits/{branch}",
                 headers=headers,
             )
             with urlopen(request, timeout=30) as response:
@@ -121,10 +121,10 @@ def github_main_metadata(repo: str) -> dict:
 
 
 def download_repo(repo: str, target: str, dest: Path) -> dict:
-    """Download main without making GitHub API availability a prerequisite."""
+    """Download a branch without making GitHub API availability a prerequisite."""
     urls = [
-        f"https://codeload.github.com/{repo}/tar.gz/refs/heads/main",
-        f"https://github.com/{repo}/archive/refs/heads/main.tar.gz",
+        f"https://codeload.github.com/{repo}/tar.gz/refs/heads/{target}",
+        f"https://github.com/{repo}/archive/refs/heads/{target}.tar.gz",
     ]
 
     errors = []
@@ -156,7 +156,7 @@ def download_repo(repo: str, target: str, dest: Path) -> dict:
                     if not archive.getmembers():
                         raise RuntimeError("Downloaded archive is empty.")
 
-                metadata = github_main_metadata(repo)
+                metadata = github_branch_metadata(repo, target)
                 metadata["archive_url"] = url
                 return metadata
 
@@ -170,7 +170,7 @@ def download_repo(repo: str, target: str, dest: Path) -> dict:
                     time.sleep(attempt * 2)
 
     raise RuntimeError(
-        "Could not download the WG_Panel main branch. "
+        f"Could not download the WG_Panel {target} branch. "
         + " | ".join(errors[-6:])
     )
 
@@ -179,6 +179,7 @@ def write_update_source(
     root: Path,
     scope: str,
     metadata: dict,
+    target: str,
 ):
     marker = (
         root
@@ -203,8 +204,8 @@ def write_update_source(
         pass
 
     payload = {
-        "source": "main",
-        "target": "main",
+        "source": target,
+        "target": target,
         "repo": metadata.get("repo"),
         "revision": metadata.get("revision"),
         "revision_short": metadata.get(
@@ -480,7 +481,7 @@ def main():
     ap.add_argument("--service", default="auto")
     ap.add_argument("--status", required=True)
     ap.add_argument("--scope", choices=["panel","node"], required=True)
-    ap.add_argument("--target", default="latest")
+    ap.add_argument("--target", default="test")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -513,16 +514,17 @@ def main():
         with tempfile.TemporaryDirectory(prefix="wg-panel-update-") as tmp:
             tmp = Path(tmp)
             archive = tmp / "source.tar.gz"
+            branch = str(args.target or "test").strip() or "test"
 
             status.set(
                 stage="download",
                 percent=27,
-                message="Downloading the main branch…",
+                message=f"Downloading the {branch} branch…",
             )
 
             source_metadata = download_repo(
                 args.repo,
-                "main",
+                branch,
                 archive,
             )
 
@@ -530,8 +532,8 @@ def main():
 
             status.set(
                 percent=38,
-                target="main",
-                source="main",
+                target=branch,
+                source=branch,
                 revision=source_metadata.get(
                     "revision"
                 ),
@@ -539,7 +541,7 @@ def main():
                     "revision_short"
                 ),
                 log=(
-                    "Repository main branch downloaded: "
+                    f"Repository {branch} branch downloaded: "
                     + str(
                         source_metadata.get(
                             "revision_short"
@@ -607,6 +609,7 @@ def main():
             root,
             args.scope,
             source_metadata,
+            branch,
         )
 
         status.set(

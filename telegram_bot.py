@@ -1733,10 +1733,11 @@ def _api_data(method: str, path: str, *, payload: dict | None = None, timeout: i
     except Exception as exc:
         return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
 
-GITHUB_REPO = "Azumi67/WG_Panel"
-GITHUB_MAIN_ARCHIVE = (
+GITHUB_REPO = "sam-soofy/WG_Panel"
+GITHUB_BRANCH = "test"
+GITHUB_BRANCH_ARCHIVE = (
     "https://codeload.github.com/"
-    f"{GITHUB_REPO}/tar.gz/refs/heads/main"
+    f"{GITHUB_REPO}/tar.gz/refs/heads/{GITHUB_BRANCH}"
 )
 
 
@@ -1794,11 +1795,11 @@ def _github_source_info(*, fresh: bool = False) -> dict:
     raw_version_urls = (
         (
             "https://raw.githubusercontent.com/"
-            f"{GITHUB_REPO}/main/VERSION"
+            f"{GITHUB_REPO}/{GITHUB_BRANCH}/VERSION"
         ),
         (
             "https://raw.githubusercontent.com/"
-            f"{GITHUB_REPO}/refs/heads/main/VERSION"
+            f"{GITHUB_REPO}/refs/heads/{GITHUB_BRANCH}/VERSION"
         ),
     )
 
@@ -1817,7 +1818,7 @@ def _github_source_info(*, fresh: bool = False) -> dict:
                     result = {
                         "ok": True,
                         "latest": version,
-                        "target": "main",
+                        "target": GITHUB_BRANCH,
                         "source": "remote VERSION",
                         "main_available": True,
                     }
@@ -1940,7 +1941,7 @@ def _github_source_info(*, fresh: bool = False) -> dict:
 
     try:
         response = requests.get(
-            GITHUB_MAIN_ARCHIVE,
+            GITHUB_BRANCH_ARCHIVE,
             headers=headers,
             timeout=20,
             stream=True,
@@ -1963,11 +1964,11 @@ def _github_source_info(*, fresh: bool = False) -> dict:
             result = {
                 "ok": True,
                 "latest": "",
-                "target": "main",
-                "source": "main branch",
+                "target": GITHUB_BRANCH,
+                "source": f"{GITHUB_BRANCH} branch",
                 "main_available": True,
                 "detail": (
-                    "The repository main branch is reachable, "
+                    f"The repository {GITHUB_BRANCH} branch is reachable, "
                     "but no remote VERSION, release, or semantic tag exists."
                 ),
             }
@@ -2080,7 +2081,7 @@ def panel_version_info(*, fresh: bool = False) -> dict:
             remote.get("detail")
             or panel_data.get("detail")
             or (
-                "The main branch is reachable, but the repository "
+                f"The {GITHUB_BRANCH} branch is reachable, but the repository "
                 "does not publish a remote VERSION, release, or tag."
             )
         )
@@ -2097,8 +2098,8 @@ def panel_version_info(*, fresh: bool = False) -> dict:
     return result
 def panel_update_status() -> dict: return _api_data("GET", "/api/panel/update/status", timeout=10)
 def panel_update_targets() -> dict: return _api_data("GET", "/api/panel/update/targets", timeout=20)
-def start_panel_update(target: str = "main") -> dict: return _api_data("POST", "/api/panel/update", payload={"target": "main"}, timeout=20)
-def start_node_update(node_id: int, target: str = "main") -> dict: return _api_data("POST", f"/api/nodes/{int(node_id)}/update", payload={"target": "main"}, timeout=20)
+def start_panel_update(target: str = GITHUB_BRANCH) -> dict: return _api_data("POST", "/api/panel/update", payload={"target": target}, timeout=20)
+def start_node_update(node_id: int, target: str = GITHUB_BRANCH) -> dict: return _api_data("POST", f"/api/nodes/{int(node_id)}/update", payload={"target": target}, timeout=20)
 def node_update_status(node_id: int) -> dict: return _api_data("GET", f"/api/nodes/{int(node_id)}/update/status", timeout=12)
 
 def _update_state(status: dict) -> str:
@@ -2250,8 +2251,8 @@ def _update_stage_label(status: dict) -> str:
         "queued": "Queued",
         "running": "Working",
         "backup": "Creating rollback backup",
-        "download": "Downloading main",
-        "downloading": "Downloading main",
+        "download": f"Downloading {GITHUB_BRANCH}",
+        "downloading": f"Downloading {GITHUB_BRANCH}",
         "extract": "Preparing files",
         "install": "Installing",
         "installing": "Installing",
@@ -2359,7 +2360,7 @@ def _update_live_text(
 
     if revision:
         lines.append(
-            f"✦ Main revision: <code>{html(revision)}</code>"
+            f"✦ {GITHUB_BRANCH} revision: <code>{html(revision)}</code>"
         )
 
     if state in {
@@ -2475,7 +2476,7 @@ async def _monitor_update_message(
     *,
     chat_id: int,
     message_id: int,
-    target_name: str = "main",
+    target_name: str = GITHUB_BRANCH,
     node_id: int | None = None,
     node_name: str | None = None,
 ):
@@ -2646,7 +2647,7 @@ def _start_update_monitor(
     context,
     update: Update,
     *,
-    target_name: str = "main",
+    target_name: str = GITHUB_BRANCH,
     node_id: int | None = None,
     node_name: str | None = None,
 ):
@@ -3018,7 +3019,7 @@ def render_update_center(*, fresh: bool = False):
 
     current = str(version.get("current") or PROJECT_VERSION or "unknown")
     latest = str(version.get("latest") or "")
-    source = str(version.get("source") or "main").strip()
+    source = str(version.get("source") or GITHUB_BRANCH).strip()
     target = str(version.get("target") or "").strip()
     main_available = bool(version.get("main_available"))
     available = bool(latest and version.get("update_available"))
@@ -3041,8 +3042,8 @@ def render_update_center(*, fresh: bool = False):
         release = "↥ Update available" if available else "● Current"
         remote = f"v{html(latest)}"
     elif main_available:
-        release = "◇ Main branch available"
-        remote = "main"
+        release = f"◇ {GITHUB_BRANCH} branch available"
+        remote = GITHUB_BRANCH
     else:
         release = "⊘ Check unavailable"
         remote = "not detected"
@@ -3054,7 +3055,7 @@ def render_update_center(*, fresh: bool = False):
         "<b>Panel release</b>",
         f"◇ Installed   <code>v{html(current)}</code>",
         f"↥ Available   <code>{remote}</code>",
-        f"⌁ Source      <code>{html(source or 'main')}</code>",
+        f"⌁ Source      <code>{html(source or GITHUB_BRANCH)}</code>",
         f"◆ State       {release}",
         "",
         "<b>Updater</b>",
@@ -3069,13 +3070,13 @@ def render_update_center(*, fresh: bool = False):
 
     rows = [
         [InlineKeyboardButton("↻ Check releases", callback_data="system:refresh"), InlineKeyboardButton("⌘ Manage nodes", callback_data="system:nodes")],
-        [InlineKeyboardButton("◇ Repository", url="https://github.com/Azumi67/WG_Panel"), InlineKeyboardButton("✦ Releases", url="https://github.com/Azumi67/WG_Panel/releases")],
+        [InlineKeyboardButton("◇ Repository", url="https://github.com/sam-soofy/WG_Panel/tree/test"), InlineKeyboardButton("✦ Releases", url="https://github.com/sam-soofy/WG_Panel/releases")],
     ]
     if not _update_busy(status):
         if available:
             rows.append([InlineKeyboardButton(f"↥ Install v{latest}", callback_data=f"system:update:confirm:{target or latest}")])
         elif main_available and not latest:
-            rows.append([InlineKeyboardButton("↥ Update from main", callback_data="system:update:confirm:main")])
+            rows.append([InlineKeyboardButton(f"↥ Update from {GITHUB_BRANCH}", callback_data=f"system:update:confirm:{GITHUB_BRANCH}")])
     rows.append([InlineKeyboardButton("← Dashboard", callback_data="home:main")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
@@ -3497,11 +3498,11 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = data.split(
             ":",
             3,
-        )[-1].strip() or "main"
+        )[-1].strip() or GITHUB_BRANCH
 
         label = (
-            "● Install main branch"
-            if target == "main"
+            f"● Install {GITHUB_BRANCH} branch"
+            if target == GITHUB_BRANCH
             else f"● Install {target}"
         )
 
@@ -3536,7 +3537,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("system:update:start:"):
-        target = "main"
+        target = GITHUB_BRANCH
 
         await edit_send(
             update,
@@ -3570,7 +3571,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         _log_admin(
             "panel_update_start",
-            "target=main",
+            f"target={GITHUB_BRANCH}",
         )
 
         queued_status = (
@@ -3594,7 +3595,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             _update_live_text(
                 queued_status,
-                target_name="main",
+                target_name=GITHUB_BRANCH,
             ),
             _update_live_keyboard(
                 terminal=False,
@@ -3604,7 +3605,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _start_update_monitor(
             context,
             update,
-            target_name="main",
+            target_name=GITHUB_BRANCH,
         )
         return
     if data == "system:nodes":
@@ -3670,7 +3671,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await asyncio.to_thread(
             start_node_update,
             node_id,
-            "main",
+            GITHUB_BRANCH,
         )
 
         if not result.get("ok"):
@@ -3688,7 +3689,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         _log_admin(
             "node_update_start",
-            f"node_id={node_id}; target=main",
+            f"node_id={node_id}; target={GITHUB_BRANCH}",
         )
 
         queued_status = (
@@ -3712,7 +3713,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             _update_live_text(
                 queued_status,
-                target_name="main",
+                target_name=GITHUB_BRANCH,
                 node_name=node_name,
             ),
             _update_live_keyboard(
@@ -3724,7 +3725,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _start_update_monitor(
             context,
             update,
-            target_name="main",
+            target_name=GITHUB_BRANCH,
             node_id=node_id,
             node_name=node_name,
         )
