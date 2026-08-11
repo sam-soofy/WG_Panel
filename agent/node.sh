@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="${WG_PANEL_DIR:-/usr/local/bin/WG_Panel-test}"
+INSTALL_DIR="${WG_PANEL_DIR:-/usr/local/bin/WG_Panel-production}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NODE_PY="$SCRIPT_DIR/node.py"
 VENV_DIR="$SCRIPT_DIR/venv"

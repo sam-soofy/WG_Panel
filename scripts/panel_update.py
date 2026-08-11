@@ -481,7 +481,7 @@ def main():
     ap.add_argument("--service", default="auto")
     ap.add_argument("--status", required=True)
     ap.add_argument("--scope", choices=["panel","node"], required=True)
-    ap.add_argument("--target", default="test")
+    ap.add_argument("--target", default="production")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -514,7 +514,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="wg-panel-update-") as tmp:
             tmp = Path(tmp)
             archive = tmp / "source.tar.gz"
-            branch = str(args.target or "test").strip() or "test"
+            branch = str(args.target or "production").strip() or "production"
 
             status.set(
                 stage="download",

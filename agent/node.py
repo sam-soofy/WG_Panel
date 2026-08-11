@@ -221,9 +221,9 @@ def _action(title: str, fn):
 AGENT_DIR = Path(__file__).resolve().parent
 ROOT_MARKER = Path.home() / ".wg_node_root.json"
 
-DEFAULT_CLONE_DIR = Path("/usr/local/bin/wg_panel-test")
+DEFAULT_CLONE_DIR = Path("/usr/local/bin/wg_panel-production")
 DEFAULT_GIT_URL = "https://github.com/sam-soofy/WG_Panel.git"
-DEFAULT_GIT_BRANCH = "test"
+DEFAULT_GIT_BRANCH = "production"
 
 def _write(p: Path, text: str):
     p.parent.mkdir(parents=True, exist_ok=True)

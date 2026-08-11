@@ -91,7 +91,7 @@ def _project_version() -> str:
 
 PANEL_VERSION = _project_version()
 PANEL_REPO = "sam-soofy/WG_Panel"
-PANEL_BRANCH = "test"
+PANEL_BRANCH = "production"
 PANEL_UPDATE_TTL = 1800
 _PANEL_UPDATE_CACHE = {
     "ts": 0,
@@ -5545,7 +5545,7 @@ def backup_node_agent_install_command():
             api_key = ''
         base_url = getattr(node, 'base_url', '') or ''
 
-    command = """sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch test https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-test; cd /opt/WG_Panel-test/agent; bash ./node.sh'"""
+    command = """sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch production https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-production; cd /opt/WG_Panel-production/agent; bash ./node.sh'"""
 
     return jsonify(
         ok=True,

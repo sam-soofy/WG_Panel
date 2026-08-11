@@ -1503,7 +1503,7 @@ def _node_version() -> str:
 
 
 NODE_REPO = "sam-soofy/WG_Panel"
-NODE_BRANCH = "test"
+NODE_BRANCH = "production"
 
 def _node_root():
     configured = (os.getenv("WG_PANEL_ROOT") or "").strip()

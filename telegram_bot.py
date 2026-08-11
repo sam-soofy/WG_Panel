@@ -1734,7 +1734,7 @@ def _api_data(method: str, path: str, *, payload: dict | None = None, timeout: i
         return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
 
 GITHUB_REPO = "sam-soofy/WG_Panel"
-GITHUB_BRANCH = "test"
+GITHUB_BRANCH = "production"
 GITHUB_BRANCH_ARCHIVE = (
     "https://codeload.github.com/"
     f"{GITHUB_REPO}/tar.gz/refs/heads/{GITHUB_BRANCH}"
@@ -3235,7 +3235,7 @@ def render_update_center(*, fresh: bool = False):
 
     rows = [
         [InlineKeyboardButton("↻ Check releases", callback_data="system:refresh"), InlineKeyboardButton("⌘ Manage nodes", callback_data="system:nodes")],
-        [InlineKeyboardButton("◇ Repository", url="https://github.com/sam-soofy/WG_Panel/tree/test"), InlineKeyboardButton("✦ Releases", url="https://github.com/sam-soofy/WG_Panel/releases")],
+        [InlineKeyboardButton("◇ Repository", url="https://github.com/sam-soofy/WG_Panel/tree/production"), InlineKeyboardButton("✦ Releases", url="https://github.com/sam-soofy/WG_Panel/releases")],
     ]
     if not _update_busy(status):
         if available:

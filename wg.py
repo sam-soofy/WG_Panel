@@ -74,8 +74,8 @@ TAG_RUN  = "[RUN]"
 
 
 REPO_URL = "https://github.com/sam-soofy/WG_Panel"
-REPO_BRANCH = "test"
-REPO_DIRNAME_DEFAULT = "WG_Panel-test"
+REPO_BRANCH = "production"
+REPO_DIRNAME_DEFAULT = "WG_Panel-production"
 
 
 UI_MAX_WIDTH = 92
@@ -4029,7 +4029,7 @@ def main_menu():
     while True:
         root = get_project()
         clear()
-        print(c("WG Panel Control", BR_WHT + BOLD) + "  " + c("sam-soofy/WG_Panel@test", BR_CYN))
+        print(c("WG Panel Control", BR_WHT + BOLD) + "  " + c("sam-soofy/WG_Panel@production", BR_CYN))
         print(hr("═", BR_CYN))
         print(render_status(root))
         print()

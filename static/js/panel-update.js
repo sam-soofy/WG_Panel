@@ -668,7 +668,7 @@
       ? `v${String(version.latest).replace(/^v/i, '')}`
       : '';
 
-    const sourceBranch = String(version?.target || 'test');
+    const sourceBranch = String(version?.target || 'production');
     const latest = latestRevision
       ? `${sourceBranch} · ${latestRevision}`
       : (latestVersion || sourceBranch);
@@ -698,7 +698,7 @@
       button.dataset.target = String(
         version?.target
         || version?.latest
-        || 'test',
+        || 'production',
       );
     }
   }
@@ -752,7 +752,7 @@
         ? `v${String(version.latest).replace(/^v/i, '')}`
         : '';
 
-      const sourceBranch = String(version.target || 'test');
+      const sourceBranch = String(version.target || 'production');
       const latest = latestRevision
         ? `${sourceBranch} · ${latestRevision}`
         : (latestVersion || sourceBranch);
@@ -855,7 +855,7 @@
       button.dataset.target
       || state.localVersion?.target
       || state.localVersion?.latest
-      || 'test',
+      || 'production',
     );
 
     try {
@@ -893,7 +893,7 @@
     if (!button || button.disabled) return;
 
     const nodeId = button.dataset.nodeId;
-    const target = button.dataset.target || 'test';
+    const target = button.dataset.target || 'production';
 
     const accepted = await askConfirmation({
       title: 'Update remote node?',

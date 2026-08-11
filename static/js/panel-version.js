@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const SOURCE_BRANCH = 'test';
+  const SOURCE_BRANCH = 'production';
   const byId = (id) => document.getElementById(id);
 
   function cleanVersion(value) {

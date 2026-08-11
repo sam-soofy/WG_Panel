@@ -1510,7 +1510,7 @@
       cachedInstallCommand = [j.command, j.next_command ? `\n# Then open the node menu:\n${j.next_command}` : ""].filter(Boolean).join("\n");
     } catch {}
     if (!cachedInstallCommand) {
-      cachedInstallCommand = `sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch test https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-test; cd /opt/WG_Panel-test/agent; bash ./node.sh'\n\n# Then open the node menu:\nnode`;
+      cachedInstallCommand = `sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch production https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-production; cd /opt/WG_Panel-production/agent; bash ./node.sh'\n\n# Then open the node menu:\nnode`;
     }
     return cachedInstallCommand;
   }
@@ -3173,7 +3173,7 @@
       cachedInstallCommand = [j.command, j.next_command ? `\n# Then open the node menu:\n${j.next_command}` : ""].filter(Boolean).join("\n");
     } catch {}
     if (!cachedInstallCommand) {
-      cachedInstallCommand = `sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch test https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-test; cd /opt/WG_Panel-test/agent; bash ./node.sh'\n\n# Then open the node menu:\nnode`;
+      cachedInstallCommand = `sudo bash -c 'apt-get update -y && apt-get install -y git curl ca-certificates; git clone --depth 1 --branch production https://github.com/sam-soofy/WG_Panel.git /opt/WG_Panel-production; cd /opt/WG_Panel-production/agent; bash ./node.sh'\n\n# Then open the node menu:\nnode`;
     }
     return cachedInstallCommand;
   }
