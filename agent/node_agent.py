@@ -2457,40 +2457,42 @@ def add_peer():
             )
 
         def _restore_runtime(block):
-        """Restore the previous runtime peer after a failed update.
-        Saved hostname endpoints must be resolved before being passed to
-        the live Wg runtime."""
-        if not block:
+            """Restore the previous runtime peer after a failed update.
+
+            Saved hostname endpoints must be resolved before being passed to
+            the live WireGuard runtime.
+            """
+            if not block:
+                _runtime_remove()
+                return
+
+            old_allowed = (_block_allowed_ips(block) or [''])[0]
+            old_endpoint = _block_value(block, 'endpoint')
+            old_keepalive = _block_value(block, 'persistentkeepalive') or 0
+
             _runtime_remove()
-            return
 
-        old_allowed = (_block_allowed_ips(block)or [''])[0]
+            if not old_allowed:
+                return
 
-        old_endpoint = _block_value(block,'endpoint',)
+            runtime_old_endpoint = ''
+            if old_endpoint:
+                runtime_old_endpoint = _runtime_endpoint(old_endpoint)
 
-        old_keepalive = (_block_value(block,'persistentkeepalive',)or 0)
-
-        _runtime_remove()
-
-        if not old_allowed:
-            return
-
-        runtime_old_endpoint = ''
-
-        if old_endpoint:
-            runtime_old_endpoint = (_runtime_endpoint(old_endpoint))
-
-        restore_result = _runtime_set(old_allowed,runtime_old_endpoint,old_keepalive,)
-
-        if restore_result.returncode != 0:
-            raise RuntimeError(
-               (
-                    restore_result.stderr
-                    or restore_result.stdout
-                    or 'Could not restore the previous peer runtime.'
-                ).strip()
+            restore_result = _runtime_set(
+                old_allowed,
+                runtime_old_endpoint,
+                old_keepalive,
             )
-        #This matters when an update fails. Without it, rollback may attempt to restore the original domain directly...
+
+            if restore_result.returncode != 0:
+                raise RuntimeError(
+                    (
+                        restore_result.stderr
+                        or restore_result.stdout
+                        or 'Could not restore the previous peer runtime.'
+                    ).strip()
+                )
 
         with open(lock_path, 'w') as lockf:
             fcntl.flock(lockf, fcntl.LOCK_EX)
