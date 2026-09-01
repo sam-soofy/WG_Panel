@@ -39,6 +39,10 @@
 
 <p dir="rtl" align="right">▪&nbsp; <b><bdi dir="ltr"><bdi dir="ltr">Subscription</bdi> Template Studio</bdi></b> برای طراحی صفحه <bdi dir="ltr">Public <bdi dir="ltr">Subscription</bdi></bdi> با <bdi dir="ltr">Live Preview</bdi> واقعی در حالت Desktop و Mobile</p>
 
+<p dir="rtl" align="right">
+▪&nbsp; امکان شخصی‌سازی مستقل <bdi dir="ltr">Template</bdi> برای هر کاربر به‌صورت جداگانه
+</p>
+
 <p dir="rtl" align="right">▪&nbsp; امکان تغییر <bdi dir="ltr">Layout</bdi>، <bdi dir="ltr">Background</bdi>، <bdi dir="ltr">Live <bdi dir="ltr">Background</bdi></bdi>، <bdi dir="ltr">Animation</bdi>، <bdi dir="ltr">Motion</bdi>، <bdi dir="ltr">Statistics</bdi>، <bdi dir="ltr">Colors</bdi>، <bdi dir="ltr">Surface</bdi>، <bdi dir="ltr">Radius</bdi>، <bdi dir="ltr">Shadow</bdi>، <bdi dir="ltr">Density</bdi>، <bdi dir="ltr">Font scale</bdi> و <bdi dir="ltr">Page width</bdi></p>
 
 <p dir="rtl" align="right">▪&nbsp; امکان تغییر نحوه نمایش Configها، تعداد ستون‌ها، ترتیب Sectionها و نمایش یا مخفی کردن بخش‌هایی مانند Usage، Configs، Install <bdi dir="ltr">WireGuard</bdi> و <bdi dir="ltr">Support</bdi></p>
@@ -79,9 +83,28 @@
 
 <p dir="rtl" align="right">▪&nbsp; دارای <b><bdi dir="ltr">Short Link</bdi></b> برای <bdi dir="ltr">Peer</bdi> و <bdi dir="ltr">Subscription</bdi> و امکان انتخاب Templateهای مختلف برای صفحات <bdi dir="ltr">Client</bdi></p>
 
-<p dir="rtl" align="right">▪&nbsp; <b><bdi dir="ltr">Update</bdi> از داخل پنل</b> با دریافت نسخه جدید از <bdi dir="ltr">Repository</bdi>، <bdi dir="ltr">Validation</bdi> فایل‌ها و <bdi dir="ltr">Rollback</bdi> خودکار در صورت ناموفق بودن <bdi dir="ltr">Update</bdi></p>
+<p dir="rtl" align="right">▪&nbsp; <b>Traffic Control</b> برای ساخت Policy اختصاصی روی هر Peer و محدود کردن دسترسی بر اساس Domain، IP/CIDR و Country با استفاده از <bdi dir="ltr">nftables</bdi></p>
 
-<p dir="rtl" align="right">▪&nbsp; امکان انتقال کامل Panel، Subscriptionها، Short Linkها و Nodeها به سرور جدید با استفاده از <bdi dir="ltr"><bdi dir="ltr">Full</bdi> Backup</bdi> و نصب مجدد Panel/<bdi dir="ltr">Node</bdi></p>
+<p dir="rtl" align="right">▪&nbsp; امکان اعمال <b>Traffic Policy</b> به Peerهای Local و Node و مدیریت Ruleها به صورت خودکار بدون نیاز به تنظیم دستی <bdi dir="ltr">nftables</bdi></p>
+
+<p dir="rtl" align="right">▪&nbsp; امکان Block کردن Domain، IP/CIDR و Geo/Country برای هر Peer به صورت جداگانه و نمایش Targetهای مسدودشده داخل بخش <bdi dir="ltr">Traffic Control</bdi></p>
+
+<p dir="rtl" align="right">▪&nbsp; دارای ابزار <b>Policy Check</b> و <b>Test Destination</b> برای بررسی Ruleهای فعال و تست اینکه یک Domain یا IP توسط Policy مربوط به Peer مسدود میشود یا خیر</p>
+
+<p dir="rtl" align="right">▪&nbsp; نمایش Counter مربوط به Packet و Traffic مسدودشده برای هر Policy و Humanize خودکار حجم از Byte تا KiB، MiB، GiB و TiB</p>
+
+<p dir="rtl" align="right">▪&nbsp; پشتیبانی از <b>Geo Blocking</b> با Country Code و مجموعه IPهای مربوط به هر کشور برای محدود کردن دسترسی Peerها بر اساس موقعیت جغرافیایی</p>
+
+<p dir="rtl" align="right">▪&nbsp; سیستم <b>HTTP Security Monitor</b> برای شناسایی درخواست‌های مشکوک HTTP و مشاهده IP، Path، Method، Status Code و تعداد Requestها</p>
+
+<p dir="rtl" align="right">▪&nbsp; امکان انتخاب حالت <bdi dir="ltr">Monitor Only</bdi> یا <bdi dir="ltr">Monitor + Block</bdi> برای مانیتور کردن درخواست‌های مشکوک یا مسدود کردن خودکار IP مهاجم</p>
+
+<p dir="rtl" align="right">▪&nbsp; پشتیبانی از Temporary Block با مدت زمان قابل تنظیم بر اساس Minute، Hour و Day و آزادسازی خودکار IP بعد از پایان زمان Block</p>
+
+<p dir="rtl" align="right">▪&nbsp; امکان تعریف CIDRهای مورد اعتماد برای جلوگیری از Block شدن IP یا Networkهای مشخص در بخش <bdi dir="ltr">HTTP Security</bdi></p>
+
+<p dir="rtl" align="right">▪&nbsp; ارسال Notification از طریق Telegram هنگام شناسایی Request مشکوک، Block شدن IP و Unblock شدن آن</p>
+
 
 
 </div>
@@ -364,6 +387,13 @@ node
 
   <p align="right">
     <img src="https://github.com/user-attachments/assets/a87617da-18e0-4065-b2ed-d38d4322958b" alt="menu screen" />
+  </p>
+</details>
+<details>
+  <summary align="right">template settings</summary>
+
+  <p align="right">
+    <img src="https://github.com/user-attachments/assets/b2bfc186-ba26-4c5f-b78d-a9889e168060" alt="menu screen" />
   </p>
 </details>
 
