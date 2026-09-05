@@ -6,6 +6,7 @@ from flask import (
     Flask, render_template, redirect, url_for, flash, request,
     jsonify, abort, current_app, make_response, send_file, session, g
 )
+
 from sqlalchemy.exc import OperationalError, IntegrityError
 from cryptography.fernet import Fernet, InvalidToken
 from pathlib import Path
@@ -274,7 +275,7 @@ def _peer_schema():
     if insp.has_table('subscription_peer'):
         link_cols = {c['name'] for c in insp.get_columns('subscription_peer')}
         if 'owned' not in link_cols:
-            # Legacy links get owned=0 on purpose: we cannot tell whether the
+            # Legacy links get owned=0 on purpose: i cannot tell whether the
             # subscription created the peer, and deleting someone else's peer
             # is not recoverable.
             statements.append(
@@ -291,17 +292,7 @@ def _peer_schema():
 
 
 def _backfill_peer_address_hosts():
-    """Fill `address_host` for legacy rows, then enforce per-interface uniqueness.
 
-    The rest of the code assumes the ``(iface_id, address_host)`` unique index
-    exists as the backstop for :func:`allocate_peer_address` (see the
-    ``interface_allocation_lock`` docstring). Silently skipping it on a
-    migrated DB with historical duplicates would remove that invariant, so
-    duplicates are *resolved* here, not just logged: the lowest-``id`` peer in
-    each duplicate group keeps its host, and the others are blanked to
-    ``address_host`` (NULL), which drops them out of the index while leaving
-    the row itself and its ``address`` untouched for manual recovery.
-    """
     pending = (
         db.session.query(Peer)
         .filter(or_(Peer.address_host.is_(None), Peer.address_host == ''))
@@ -324,8 +315,6 @@ def _backfill_peer_address_hosts():
     if duplicates:
         resolved = 0
         for iface_id, host, _count in duplicates:
-            # Keep the oldest peer (lowest id) on its host; detach the rest by
-            # blanking address_host. Their `address` column is unchanged.
             dup_peers = (
                 db.session.query(Peer.id)
                 .filter(Peer.iface_id == iface_id, Peer.address_host == host)
@@ -360,17 +349,11 @@ def _backfill_peer_address_hosts():
                 'ON peer (iface_id, address_host)'
             ))
     except Exception:
-        # Already present as a table-level constraint on a fresh database.
         app.logger.debug("Peer address uniqueness index not created", exc_info=True)
 
 
 def _interface_schema():
-    """Add the client endpoint override columns to older databases.
 
-    Both columns stay NULL on upgrade, so endpoint behaviour is unchanged until
-    an operator saves an override. `db.create_all()` does not alter existing
-    tables, which is why this exists.
-    """
     insp = inspect(db.engine)
 
     if not insp.has_table('interface_config'):
@@ -406,12 +389,14 @@ _DEF_PROFILE = {
     'persistent_keepalive': None,
     'mtu': None,
     'endpoint': '',
+    'peer_endpoint': '',
     'data_limit_value': 0,
     'data_limit_unit': 'Gi',
     'start_on_first_use': False,
     'unlimited': False,
     'time_limit_days': 0,
     'time_limit_hours': 0,
+    'time_limit_minutes': 0,
 }
 
 def _migrate_single_profile():
@@ -426,8 +411,6 @@ def _migrate_single_profile():
         data = {"active": "Default", "profiles": {"Default": base}}
         with open(PEER_PROFILES_FILE, 'w') as f:
             json.dump(data, f, indent=2)
-        # try: os.remove(PEER_PROFILE_FILE)
-        # except Exception: pass
 
 def _load_profiles():
     os.makedirs(app.instance_path, exist_ok=True)
@@ -503,20 +486,66 @@ def list_apipeer_profiles():
 @login_required
 def rename_apipeer_profile():
     data = request.get_json(force=True, silent=True) or {}
-    old = (data.get('old') or '').strip()
-    new = (data.get('new') or '').strip()
+
+    raw_old = data.get('old')
+    raw_new = data.get('new')
+
+    if not isinstance(raw_old, str) or not isinstance(raw_new, str):
+        return jsonify(
+            ok=False,
+            error='invalid_name',
+            message='The old and new profile names must be text.',
+        ), 400
+
+    old = raw_old.strip()
+    new = raw_new.strip()
+
     if not old or not new:
-        return jsonify(error="old_and_new_required"), 400
-    d = _load_profiles()
-    if old not in d['profiles']:
-        return jsonify(error="not_found"), 404
-    if new in d['profiles']:
-        return jsonify(error="exists"), 409
-    d['profiles'][new] = d['profiles'].pop(old)
-    if d.get('active') == old:
-        d['active'] = new
-    _save_profiles(d)
-    return jsonify(ok=True, active=d['active'])
+        return jsonify(
+            ok=False,
+            error='old_and_new_required',
+            message='Both the current name and new name are required.',
+        ), 400
+
+    if len(new) > 80:
+        return jsonify(
+            ok=False,
+            error='name_too_long',
+            message='Profile names cannot exceed 80 characters.',
+        ), 400
+
+    data_store = _load_profiles()
+    profiles = data_store.get('profiles') or {}
+
+    if old not in profiles:
+        return jsonify(
+            ok=False,
+            error='not_found',
+            message='The selected profile was not found.',
+        ), 404
+
+    if new != old and new in profiles:
+        return jsonify(
+            ok=False,
+            error='exists',
+            message='A profile with that name already exists.',
+        ), 409
+
+    if new != old:
+        profiles[new] = profiles.pop(old)
+
+    if data_store.get('active') == old:
+        data_store['active'] = new
+
+    _save_profiles(data_store)
+
+    return jsonify(
+        ok=True,
+        old_name=old,
+        name=new,
+        active=data_store.get('active') or 'Default',
+        profiles=sorted(profiles.keys()),
+    )
 
 @app.route('/api/peer_profile', methods=['GET'])
 @login_required
@@ -528,19 +557,718 @@ def get_apipeer_profile():
 @login_required
 def save_apipeer_profile():
     data = request.get_json(force=True, silent=True) or {}
-    name = (data.get('name') or 'Default').strip() or 'Default'
-    payload = {k: v for k, v in data.items() if k != 'name'}
+
+    raw_name = data.get('name')
+
+    if raw_name is None:
+        raw_name = 'Default'
+
+    if not isinstance(raw_name, str):
+        return jsonify(
+            ok=False,
+            error='invalid_name',
+            message='Profile name must be text.',
+        ), 400
+
+    name = raw_name.strip() or 'Default'
+
+    if len(name) > 80:
+        return jsonify(
+            ok=False,
+            error='name_too_long',
+            message='Profile names cannot exceed 80 characters.',
+        ), 400
+
+    payload = {
+        key: value
+        for key, value in data.items()
+        if key != 'name'
+    }
+
     _set_profile(name, payload)
-    return jsonify(ok=True, saved_name=name, saved=_get_profile(name))
+
+    return jsonify(
+        ok=True,
+        name=name,
+        saved_name=name,
+        saved=_get_profile(name),
+    )
 
 @app.route('/api/peer_profile/activate', methods=['POST'])
 @login_required
 def activate_apipeer_profile():
     data = request.get_json(force=True, silent=True) or {}
-    name = (data.get('name') or 'Default').strip() or 'Default'
-    _set_active_profile(name)
-    return jsonify(ok=True, active=name)
 
+    raw_name = data.get('name')
+
+    if raw_name is None:
+        raw_name = 'Default'
+
+    if not isinstance(raw_name, str):
+        return jsonify(
+            ok=False,
+            error='invalid_name',
+            message='Profile name must be text.',
+        ), 400
+
+    name = raw_name.strip() or 'Default'
+
+    profiles_data = _load_profiles()
+
+    if name not in (profiles_data.get('profiles') or {}):
+        return jsonify(
+            ok=False,
+            error='not_found',
+            message='The selected profile was not found.',
+        ), 404
+
+    _set_active_profile(name)
+
+    return jsonify(
+        ok=True,
+        active=name,
+    )
+
+# ============================================================
+# Subscription profiles
+# Reusable profiles for the subscription create-client workflow
+# ============================================================
+
+SUBSCRIPTION_PROFILES_FILE = os.path.join(
+    app.instance_path,
+    'subscription_profiles.json',
+)
+
+
+def _load_subscription_profiles():
+
+    os.makedirs(
+        app.instance_path,
+        exist_ok=True,
+    )
+
+    try:
+        with open(
+            SUBSCRIPTION_PROFILES_FILE,
+            'r',
+            encoding='utf-8',
+        ) as profile_file:
+            data = json.load(
+                profile_file
+            )
+
+    except FileNotFoundError:
+        data = {}
+
+    except Exception:
+        current_app.logger.warning(
+            'Could not read subscription profiles.',
+            exc_info=True,
+        )
+        data = {}
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        data = {}
+
+    profiles = data.get(
+        'profiles'
+    )
+
+    if not isinstance(
+        profiles,
+        dict,
+    ):
+        profiles = {}
+
+    cleaned_profiles = {}
+
+    for profile_name, profile_data in profiles.items():
+        clean_name = str(
+            profile_name or ''
+        ).strip()
+
+        if not clean_name:
+            continue
+
+        cleaned_profiles[
+            clean_name
+        ] = (
+            profile_data
+            if isinstance(
+                profile_data,
+                dict,
+            )
+            else {}
+        )
+
+    active_name = str(
+        data.get('active')
+        or ''
+    ).strip()
+
+    if (
+        active_name
+        and active_name
+        not in cleaned_profiles
+    ):
+        active_name = ''
+
+    if (
+        not active_name
+        and cleaned_profiles
+    ):
+        active_name = next(
+            iter(
+                sorted(
+                    cleaned_profiles.keys(),
+                    key=str.lower,
+                )
+            )
+        )
+
+    return {
+        'active': active_name,
+        'profiles': cleaned_profiles,
+    }
+
+
+def _save_subscription_profiles(data):
+    """
+    Save subscription profiles atomically.
+    """
+    os.makedirs(
+        app.instance_path,
+        exist_ok=True,
+    )
+
+    profiles = (
+        data.get('profiles')
+        if isinstance(data, dict)
+        else {}
+    )
+
+    if not isinstance(
+        profiles,
+        dict,
+    ):
+        profiles = {}
+
+    active_name = str(
+        (
+            data.get('active')
+            if isinstance(data, dict)
+            else ''
+        )
+        or ''
+    ).strip()
+
+    payload = {
+        'active': active_name,
+        'profiles': profiles,
+    }
+
+    temporary_path = (
+        SUBSCRIPTION_PROFILES_FILE
+        + '.tmp'
+    )
+
+    with open(
+        temporary_path,
+        'w',
+        encoding='utf-8',
+    ) as profile_file:
+        json.dump(
+            payload,
+            profile_file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    os.replace(
+        temporary_path,
+        SUBSCRIPTION_PROFILES_FILE,
+    )
+
+    try:
+        os.chmod(
+            SUBSCRIPTION_PROFILES_FILE,
+            0o600,
+        )
+    except Exception:
+        pass
+
+
+def _subscription_profile_rows(data=None):
+    """
+    Return profile metadata for the profile dropdown.
+    """
+    data = (
+        data
+        or _load_subscription_profiles()
+    )
+
+    active_name = str(
+        data.get('active')
+        or ''
+    ).strip()
+
+    profiles = (
+        data.get('profiles')
+        or {}
+    )
+
+    return [
+        {
+            'name': profile_name,
+            'default': (
+                profile_name
+                == active_name
+            ),
+            'active': (
+                profile_name
+                == active_name
+            ),
+        }
+        for profile_name in sorted(
+            profiles.keys(),
+            key=str.lower,
+        )
+    ]
+
+
+def _sanitize_subscription_profile(profile):
+
+    if not isinstance(
+        profile,
+        dict,
+    ):
+        profile = {}
+
+    include = profile.get(
+        'include'
+    )
+
+    if not isinstance(
+        include,
+        dict,
+    ):
+        include = {}
+
+    cleaned = {
+        'include': {
+            'client': bool(
+                include.get('client')
+            ),
+            'advanced': bool(
+                include.get('advanced')
+            ),
+            'interfaces': bool(
+                include.get('interfaces')
+            ),
+            'template': bool(
+                include.get('template')
+            ),
+        }
+    }
+
+    for section_name in (
+    'client',
+    'advanced',
+    'template',
+    ):
+        section = profile.get(section_name)
+
+        if isinstance(section, dict):
+            cleaned[section_name] = section
+
+
+    interfaces = profile.get('interfaces')
+
+    if isinstance(interfaces, list):
+        cleaned['interfaces'] = [
+            item
+            for item in interfaces[:200]
+            if isinstance(item, dict)
+        ]
+
+    return cleaned
+
+
+@app.get('/api/subscription_profiles')
+@login_required
+def subscription_profiles_list():
+    store = (
+        _load_subscription_profiles()
+    )
+
+    return jsonify(
+        ok=True,
+        active=(
+            store.get('active')
+            or ''
+        ),
+        profiles=(
+            _subscription_profile_rows(
+                store
+            )
+        ),
+    )
+
+
+@app.post('/api/subscription_profiles')
+@login_required
+def subscription_profile_save():
+    payload = (
+        request.get_json(
+            silent=True,
+        )
+        or {}
+    )
+
+    profile_name = str(
+        payload.get('name')
+        or ''
+    ).strip()
+
+    if not profile_name:
+        return jsonify(
+            ok=False,
+            error='name_required',
+            message='Enter a profile name.',
+        ), 400
+
+    if len(profile_name) > 80:
+        return jsonify(
+            ok=False,
+            error='name_too_long',
+            message=(
+                'Profile names cannot exceed '
+                '80 characters.'
+            ),
+        ), 400
+
+    profile_payload = (
+        payload.get('profile')
+    )
+
+    if not isinstance(
+        profile_payload,
+        dict,
+    ):
+
+        profile_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {
+                'name',
+                'activate',
+                'set_active',
+            }
+        }
+
+    cleaned_profile = (
+        _sanitize_subscription_profile(
+            profile_payload
+        )
+    )
+
+    store = (
+        _load_subscription_profiles()
+    )
+
+    profiles = store.setdefault(
+        'profiles',
+        {},
+    )
+
+    profiles[
+        profile_name
+    ] = cleaned_profile
+
+    should_activate = bool(
+        payload.get('activate')
+        or payload.get('set_active')
+        or not store.get('active')
+    )
+
+    if should_activate:
+        store[
+            'active'
+        ] = profile_name
+
+    _save_subscription_profiles(
+        store
+    )
+
+    return jsonify(
+        ok=True,
+        name=profile_name,
+        saved_name=profile_name,
+        active=(
+            store.get('active')
+            or ''
+        ),
+        profiles=(
+            _subscription_profile_rows(
+                store
+            )
+        ),
+    )
+
+
+@app.get('/api/subscription_profiles/<path:profile_name>')
+@login_required
+def subscription_profile_get(profile_name):
+    clean_name = str(
+        profile_name or ''
+    ).strip()
+
+    store = (
+        _load_subscription_profiles()
+    )
+
+    profile = (
+        store.get('profiles')
+        or {}
+    ).get(
+        clean_name
+    )
+
+    if not isinstance(
+        profile,
+        dict,
+    ):
+        return jsonify(
+            ok=False,
+            error='not_found',
+            message='Subscription profile was not found.',
+        ), 404
+
+    return jsonify(
+        ok=True,
+        name=clean_name,
+        active=(
+            store.get('active')
+            == clean_name
+        ),
+        profile=profile,
+    )
+
+
+@app.post(
+    '/api/subscription_profiles/<path:profile_name>/activate'
+)
+@login_required
+def subscription_profile_activate(profile_name):
+    clean_name = str(
+        profile_name or ''
+    ).strip()
+
+    store = (
+        _load_subscription_profiles()
+    )
+
+    profiles = (
+        store.get('profiles')
+        or {}
+    )
+
+    if clean_name not in profiles:
+        return jsonify(
+            ok=False,
+            error='not_found',
+            message='Subscription profile was not found.',
+        ), 404
+
+    store[
+        'active'
+    ] = clean_name
+
+    _save_subscription_profiles(
+        store
+    )
+
+    return jsonify(
+        ok=True,
+        active=clean_name,
+        profiles=(
+            _subscription_profile_rows(
+                store
+            )
+        ),
+    )
+
+
+@app.post(
+    '/api/subscription_profiles/<path:profile_name>/rename'
+)
+@login_required
+def subscription_profile_rename(profile_name):
+    old_name = str(
+        profile_name or ''
+    ).strip()
+
+    payload = (
+        request.get_json(
+            silent=True,
+        )
+        or {}
+    )
+
+    new_name = str(
+        payload.get('name')
+        or payload.get('new')
+        or ''
+    ).strip()
+
+    if not new_name:
+        return jsonify(
+            ok=False,
+            error='name_required',
+            message='Enter the new profile name.',
+        ), 400
+
+    if len(new_name) > 80:
+        return jsonify(
+            ok=False,
+            error='name_too_long',
+            message=(
+                'Profile names cannot exceed '
+                '80 characters.'
+            ),
+        ), 400
+
+    store = (
+        _load_subscription_profiles()
+    )
+
+    profiles = (
+        store.get('profiles')
+        or {}
+    )
+
+    if old_name not in profiles:
+        return jsonify(
+            ok=False,
+            error='not_found',
+            message='Subscription profile was not found.',
+        ), 404
+
+    if (
+        new_name != old_name
+        and new_name in profiles
+    ):
+        return jsonify(
+            ok=False,
+            error='exists',
+            message=(
+                'A subscription profile with that '
+                'name already exists.'
+            ),
+        ), 409
+
+    if new_name != old_name:
+        profiles[
+            new_name
+        ] = profiles.pop(
+            old_name
+        )
+
+    if (
+        store.get('active')
+        == old_name
+    ):
+        store[
+            'active'
+        ] = new_name
+
+    _save_subscription_profiles(
+        store
+    )
+
+    return jsonify(
+        ok=True,
+        old_name=old_name,
+        name=new_name,
+        active=(
+            store.get('active')
+            or ''
+        ),
+        profiles=(
+            _subscription_profile_rows(
+                store
+            )
+        ),
+    )
+
+
+@app.delete(
+    '/api/subscription_profiles/<path:profile_name>'
+)
+@login_required
+def subscription_profile_delete(profile_name):
+    clean_name = str(
+        profile_name or ''
+    ).strip()
+
+    store = (
+        _load_subscription_profiles()
+    )
+
+    profiles = (
+        store.get('profiles')
+        or {}
+    )
+
+    if clean_name not in profiles:
+        return jsonify(
+            ok=False,
+            error='not_found',
+            message='Subscription profile was not found.',
+        ), 404
+
+    profiles.pop(
+        clean_name,
+        None,
+    )
+
+    if (
+        store.get('active')
+        == clean_name
+    ):
+        remaining_names = sorted(
+            profiles.keys(),
+            key=str.lower,
+        )
+
+        store[
+            'active'
+        ] = (
+            remaining_names[0]
+            if remaining_names
+            else ''
+        )
+
+    _save_subscription_profiles(
+        store
+    )
+
+    return jsonify(
+        ok=True,
+        deleted=clean_name,
+        active=(
+            store.get('active')
+            or ''
+        ),
+        profiles=(
+            _subscription_profile_rows(
+                store
+            )
+        ),
+    )
 def _effective_dns(peer):
     return (peer.dns or getattr(peer.iface, 'dns', None) or _panel_default_dns())
 
@@ -1711,16 +2439,9 @@ def _recovery(rec: Admin2FA, code: str) -> bool:
 
 @csrf.exempt
 @app.route('/api/admin_logs', methods=['GET', 'POST', 'DELETE'])
+@require_api_key_or_login
 def admin_logs():
     if request.method == 'GET':
-        try:
-            from flask_login import current_user as cu
-            if not (getattr(cu, "is_authenticated", False) or request.headers.get("X-API-KEY")):
-                return jsonify(error="auth_required"), 401
-        except Exception:
-            if not request.headers.get("X-API-KEY"):
-                return jsonify(error="auth_required"), 401
-
         q        = (request.args.get('q') or '').strip().lower()
         action   = (request.args.get('action') or '').strip().lower()
         channel  = (request.args.get('channel') or '').strip().lower()
@@ -1794,14 +2515,6 @@ def admin_logs():
         except Exception:
             pass
         return jsonify(ok=True)
-
-    if not request.headers.get("X-API-KEY"):
-        try:
-            from flask_login import current_user as cu
-            if not getattr(cu, "is_authenticated", False):
-                return jsonify(error="auth_required"), 401
-        except Exception:
-            return jsonify(error="auth_required"), 401
 
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
@@ -1913,6 +2626,12 @@ def _load_tg_settings():
         'login_success': True,
         'login_fail': True,
         'suspicious_4xx': True,
+        'security_block': True,
+        'security_release': True,
+        'security_auto_release': False,
+        'traffic_policy_change': False,
+        'traffic_apply_success': False,
+        'traffic_apply_failed': True,
         'backup_success': False,
         'backup_failed': True,
         'update_success': True,
@@ -1931,6 +2650,263 @@ def _load_tg_settings():
 _TG_EVENT_LOCK = threading.Lock()
 _TG_EVENT_LAST = {}
 
+def _tg_human_bytes(value) -> str:
+    try:
+        value = max(
+            0,
+            int(value or 0),
+        )
+    except Exception:
+        return '0 B'
+
+    units = (
+        'B',
+        'KiB',
+        'MiB',
+        'GiB',
+        'TiB',
+    )
+
+    amount = float(value)
+
+    for unit in units:
+        if (
+            amount < 1024
+            or unit == units[-1]
+        ):
+            if unit == 'B':
+                return f'{int(amount)} B'
+
+            if amount >= 100:
+                return f'{amount:.0f} {unit}'
+
+            if amount >= 10:
+                return f'{amount:.1f} {unit}'
+
+            return f'{amount:.2f} {unit}'
+
+        amount /= 1024.0
+
+    return f'{value} B'
+
+def _tg_human_duration(value) -> str:
+
+    try:
+        seconds = max(
+            0,
+            int(float(value or 0)),
+        )
+    except Exception:
+        return ''
+
+    days, rem = divmod(
+        seconds,
+        86400,
+    )
+
+    hours, rem = divmod(
+        rem,
+        3600,
+    )
+
+    minutes, secs = divmod(
+        rem,
+        60,
+    )
+
+    parts = []
+
+    if days:
+        parts.append(
+            f"{days} day"
+            + (
+                ""
+                if days == 1
+                else "s"
+            )
+        )
+
+    if hours:
+        parts.append(
+            f"{hours} hour"
+            + (
+                ""
+                if hours == 1
+                else "s"
+            )
+        )
+
+    if minutes:
+        parts.append(
+            f"{minutes} minute"
+            + (
+                ""
+                if minutes == 1
+                else "s"
+            )
+        )
+
+    if (
+        secs
+        and not days
+        and not hours
+    ):
+        parts.append(
+            f"{secs} second"
+            + (
+                ""
+                if secs == 1
+                else "s"
+            )
+        )
+
+    if not parts:
+        return "0 seconds"
+
+    return " ".join(
+        parts[:3]
+    )
+
+
+def _tg_system_timezone():
+    """
+    Telegram timestamps use the global panel timezone.
+
+    All stored timestamps remain UTC.
+    """
+    try:
+        return _panel_timezone()
+    except Exception:
+        return timezone.utc
+
+
+def _tg_parse_datetime(value):
+    if value in (None, "", "—"):
+        return None
+
+    if isinstance(value, datetime):
+        parsed = value
+
+    elif isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(
+                float(value),
+                tz=timezone.utc,
+            )
+        except Exception:
+            return None
+
+    else:
+        raw = str(value).strip()
+
+        if not raw:
+            return None
+
+        try:
+            if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+                parsed = datetime.fromtimestamp(
+                    float(raw),
+                    tz=timezone.utc,
+                )
+            else:
+                normalized = raw
+
+                if normalized.endswith("Z"):
+                    normalized = normalized[:-1] + "+00:00"
+
+                parsed = datetime.fromisoformat(normalized)
+
+        except Exception:
+            return None
+
+    # Database/API datetimes without an offset are treated as UTC.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
+def _tg_human_delta(seconds: float) -> str:
+    future = seconds < 0
+    seconds = abs(int(seconds))
+
+    if seconds < 10:
+        return "in a moment" if future else "just now"
+
+    if seconds < 60:
+        value = seconds
+        text = f"{value} second{'s' if value != 1 else ''}"
+
+    elif seconds < 3600:
+        value = max(1, seconds // 60)
+        text = f"{value} minute{'s' if value != 1 else ''}"
+
+    elif seconds < 86400:
+        value = max(1, seconds // 3600)
+        text = f"{value} hour{'s' if value != 1 else ''}"
+
+    elif seconds < 604800:
+        value = max(1, seconds // 86400)
+        text = f"{value} day{'s' if value != 1 else ''}"
+
+    elif seconds < 2592000:
+        value = max(1, seconds // 604800)
+        text = f"{value} week{'s' if value != 1 else ''}"
+
+    elif seconds < 31536000:
+        value = max(1, seconds // 2592000)
+        text = f"{value} month{'s' if value != 1 else ''}"
+
+    else:
+        value = max(1, seconds // 31536000)
+        text = f"{value} year{'s' if value != 1 else ''}"
+
+    return f"in {text}" if future else f"{text} ago"
+
+
+def _tg_human_datetime(
+    value,
+    *,
+    relative: bool = True,
+    seconds: bool = False,
+    fallback: str = "—",
+) -> str:
+    """
+    Human-friendly Telegram datetime in the server/system timezone.
+
+    Example:
+        23 Aug 2026 · 22:31 (5 minutes ago)
+        24 Aug 2026 · 03:00 (in 4 hours)
+    """
+    parsed = _tg_parse_datetime(value)
+
+    if parsed is None:
+        return fallback if value in (None, "", "—") else str(value)
+
+    local_tz = _tg_system_timezone()
+    local_dt = parsed.astimezone(local_tz)
+    now = datetime.now(timezone.utc).astimezone(local_tz)
+
+    if seconds:
+        absolute = local_dt.strftime("%d %b %Y · %H:%M:%S")
+    else:
+        absolute = local_dt.strftime("%d %b %Y · %H:%M")
+
+    if not relative:
+        return absolute
+
+    delta = (now - local_dt).total_seconds()
+    human = _tg_human_delta(delta)
+
+    return f"{absolute} ({human})"
+
+
+def _tg_now_text() -> str:
+    return _tg_human_datetime(
+        datetime.now(timezone.utc),
+        relative=False,
+        seconds=True,
+    )
 
 def _tg_event_escape(value) -> str:
     import html
@@ -1966,13 +2942,7 @@ def _send_telegram_event(
     dedupe_key: str = '',
     dedupe_seconds: int = 60,
 ) -> None:
-    """
-    Send one operational Telegram event.
 
-    Telegram credentials remain on the panel. This function never sends
-    credentials to a remote node.
-
-    """
     event_key = str(
         event_key or ''
     ).strip()
@@ -1980,12 +2950,17 @@ def _send_telegram_event(
     if not event_key:
         return
 
-    if not _tg_event_enabled(event_key):
+    if not _tg_event_enabled(
+        event_key
+    ):
         return
 
-    settings = _load_tg_settings() or {}
+    settings = (
+        _load_tg_settings()
+        or {}
+    )
 
-    bot_token = (
+    bot_token = str(
         settings.get('bot_token')
         or ''
     ).strip()
@@ -2011,6 +2986,10 @@ def _send_telegram_event(
     if not bot_token or not recipients:
         return
 
+    # -----------------
+    # Deduplication
+    # -----------------
+
     event_identity = (
         event_key,
         str(
@@ -2020,9 +2999,12 @@ def _send_telegram_event(
         ).strip(),
     )
 
-    monotonic_now = time.monotonic()
+    monotonic_now = (
+        time.monotonic()
+    )
 
     with _TG_EVENT_LOCK:
+
         previous_time = float(
             _TG_EVENT_LAST.get(
                 event_identity
@@ -2032,8 +3014,12 @@ def _send_telegram_event(
 
         if (
             dedupe_seconds > 0
-            and monotonic_now - previous_time
-            < dedupe_seconds
+            and previous_time
+            and (
+                monotonic_now
+                - previous_time
+                < dedupe_seconds
+            )
         ):
             return
 
@@ -2041,7 +3027,10 @@ def _send_telegram_event(
             event_identity
         ] = monotonic_now
 
+        # Prevent the dedupe dictionary
+        # from growing forever.
         if len(_TG_EVENT_LAST) > 1000:
+
             expiry_time = (
                 monotonic_now
                 - 86400
@@ -2050,53 +3039,243 @@ def _send_telegram_event(
             for old_key, old_time in list(
                 _TG_EVENT_LAST.items()
             ):
-                if float(
-                    old_time or 0
-                ) < expiry_time:
+
+                if (
+                    float(
+                        old_time
+                        or 0
+                    )
+                    < expiry_time
+                ):
+
                     _TG_EVENT_LAST.pop(
                         old_key,
                         None,
                     )
 
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        '%Y-%m-%d %H:%M:%S UTC'
+    # -----------------
+    # Monochrome icons
+    # -----------------
+
+    icon_map = {
+        'app_down': '⊘',
+        'app_up': '●',
+
+        'node_down': '○',
+        'node_up': '●',
+
+        'iface_down': '○',
+        'iface_up': '●',
+
+        'peer_expired': '◇',
+        'peer_limit': '◆',
+
+        'login_success': '●',
+        'login_fail': '⊘',
+
+        'suspicious_4xx': '◆',
+        'security_block': '⊘',
+        'security_release': '◇',
+        'security_auto_release': '◇',
+
+        'traffic_policy_change': '◇',
+        'traffic_apply_success': '●',
+        'traffic_apply_failed': '⊘',
+
+        'backup_success': '●',
+        'backup_failed': '⊘',
+
+        'update_success': '●',
+        'update_failed': '⊘',
+    }
+
+    icon = icon_map.get(
+        event_key,
+        '◇',
     )
 
-    message_lines = [
-        f'<b>{_tg_event_escape(title)}</b>',
+    clean_title = re.sub(
+        r'^[●○◆◇◷⌂⊘✦↥↻]+\s*',
         '',
-    ]
+        str(
+            title or ''
+        ).strip(),
+    )
 
-    if status:
-        message_lines.append(
-            '◆ <b>Status</b>  '
-            f'{_tg_event_escape(status)}'
-        )
+    clean_status = str(
+        status or ''
+    ).strip()
+
+    # Footer timestamp uses the
+    # global panel timezone.
+    timestamp = _tg_now_text()
+
+    hostname = str(
+        socket.gethostname()
+        or 'panel'
+    ).strip()
+
+    # -----------------
+    # Datetime labels
+    # -----------------
+
+    time_labels = {
+        'time',
+        'timestamp',
+
+        'created',
+        'created at',
+
+        'updated',
+        'updated at',
+
+        'started',
+        'started at',
+
+        'completed',
+        'completed at',
+
+        'failed at',
+
+        'blocked at',
+        'blocked until',
+
+        'released at',
+
+        'expires',
+        'expires at',
+
+        'last seen',
+        'last run',
+
+        'next run',
+        'next check',
+
+        'recovered at',
+
+        'schedule time',
+        'scheduled for',
+    }
+
+    # These are fixed schedule timestamps.
+    # Relative text such as "(just now)"
+    # is not useful for them.
+    absolute_only_time_labels = {
+        'schedule time',
+        'scheduled for',
+    }
+
+    rows = []
 
     for label, value in (
         details or []
     ):
+
         if value in (
             None,
             '',
         ):
             continue
 
-        message_lines.append(
-            f'◇ <b>{_tg_event_escape(label)}</b>  '
-            f'<code>{_tg_event_escape(value)}</code>'
+        clean_label = str(
+            label or ''
+        ).strip()
+
+        if not clean_label:
+            continue
+
+        label_key = (
+            clean_label.lower()
         )
 
+        # --------------------------
+        # Human-readable timestamps
+        # --------------------------
+
+        if label_key in time_labels:
+
+            clean_value = (
+                _tg_human_datetime(
+                    value,
+                    relative=(
+                        label_key
+                        not in
+                        absolute_only_time_labels
+                    ),
+                    seconds=False,
+                    fallback='—',
+                )
+            )
+
+        else:
+
+            clean_value = str(
+                value
+                if value is not None
+                else ''
+            ).strip()
+
+        if not clean_value:
+            continue
+
+        rows.append(
+            (
+                clean_label,
+                clean_value,
+            )
+        )
+
+    # -------------------------
+    # Mobile-friendly layout
+    # -------------------------
+
+    message_lines = [
+        (
+            f'{icon} '
+            f'<b>'
+            f'{_tg_event_escape(clean_title)}'
+            f'</b>'
+        )
+    ]
+
+    if (
+        clean_status
+        or rows
+    ):
+        message_lines.append(
+            ''
+        )
+
+    if clean_status:
+        message_lines.append(
+            (
+                '<b>Status</b> · '
+                f'{_tg_event_escape(clean_status)}'
+            )
+        )
+
+    for label, value in rows:
+
+        message_lines.append(
+            (
+                f'<b>'
+                f'{_tg_event_escape(label)}'
+                f'</b> · '
+                f'{_tg_event_escape(value)}'
+            )
+        )
+
+    # -----------------
+    # Message footer
+    # -----------------
+
     message_lines.extend([
+        '',
         (
-            '◷ <b>Time</b>  '
-            f'<code>{_tg_event_escape(timestamp)}</code>'
-        ),
-        (
-            '⌂ <b>Panel host</b>  '
-            f'<code>{_tg_event_escape(socket.gethostname())}</code>'
+            '◷ '
+            f'{_tg_event_escape(timestamp)}'
+            ' · '
+            f'{_tg_event_escape(hostname)}'
         ),
     ])
 
@@ -2104,15 +3283,25 @@ def _send_telegram_event(
         message_lines
     )
 
+    # Keep a real Flask app reference
+    # because sending happens in a thread.
     flask_app = (
         current_app
         ._get_current_object()
     )
 
+    # -----------------
+    # Background sender
+    # -----------------
+
     def worker():
+
         with flask_app.app_context():
+
             for chat_id in recipients:
+
                 try:
+
                     response = requests.post(
                         (
                             'https://api.telegram.org/'
@@ -2128,10 +3317,13 @@ def _send_telegram_event(
                     )
 
                     if not response.ok:
+
                         flask_app.logger.warning(
                             'Telegram event failed: '
-                            'event=%s chat_id=%s '
-                            'status=%s response=%s',
+                            'event=%s '
+                            'chat_id=%s '
+                            'status=%s '
+                            'response=%s',
                             event_key,
                             chat_id,
                             response.status_code,
@@ -2139,9 +3331,11 @@ def _send_telegram_event(
                         )
 
                 except Exception:
+
                     flask_app.logger.debug(
                         'Telegram event failed: '
-                        'event=%s chat_id=%s',
+                        'event=%s '
+                        'chat_id=%s',
                         event_key,
                         chat_id,
                         exc_info=True,
@@ -2157,446 +3351,1491 @@ def _send_telegram_event(
     ).start()
 
 # ========================
-# HTTP 4xx burst monitor
+# HTTP security center
 # ========================
 
-_HTTP_4XX_STATE_FILE = os.path.join(
-    app.instance_path,
-    "suspicious_4xx_state.json",
-)
+_HTTP_4XX_STATE_FILE = os.path.join(app.instance_path, "suspicious_4xx_state.json")
+_HTTP_4XX_LOCK_FILE = os.path.join(app.instance_path, "suspicious_4xx_state.lock")
+_HTTP_SECURITY_SETTINGS_FILE = os.path.join(app.instance_path, "http_security_settings.json")
+_HTTP_SECURITY_SETTINGS_CACHE = {"stamp": None, "settings": {}}
+_HTTP_4XX_STATUSES = {401, 403, 404, 405, 429}
 
-_HTTP_4XX_LOCK_FILE = os.path.join(
-    app.instance_path,
-    "suspicious_4xx_state.lock",
-)
-
-_HTTP_4XX_STATUSES = {
-    401,
-    403,
-    404,
-    405,
-    429,
+_HTTP_SECURITY_DEFAULTS = {
+    "enabled": True,
+    "response_mode": "monitor",       # monitor | block
+    "ip_source": "direct",            # direct | effective
+    "block_scope": "all",             # all | auth_admin
+    "threshold": 20,
+    "window_seconds": 60,
+    "sensitive_threshold": 3,
+    "rate_limit_threshold": 10,
+    "login_threshold": 5,
+    "login_window_seconds": 600,
+    "cooldown_seconds": 600,
+    "block_seconds": 900,
+    "max_block_seconds": 86400,
+    "escalate": True,
+    "enrich_ip": False,
+    "firewall_enabled": False,
+    "firewall_after_offenses": 3,
+    "trusted_networks": ["127.0.0.1/32", "::1/128"],
+    "deny_networks": [],
 }
 
-_HTTP_4XX_WINDOW_SEC = 60
-_HTTP_4XX_THRESHOLD = 20
-_HTTP_4XX_COOLDOWN_SEC = 600
+_HTTP_SECURITY_OFFENSE_RESET_SEC = 7 * 24 * 60 * 60
+_HTTP_SECURITY_HISTORY_LIMIT = 500
+_HTTP_SECURITY_TEMP_ALLOW_MAX_SEC = 7 * 24 * 60 * 60
+_HTTP_SECURITY_NFT_TABLE = "wgpanel_security"
+_HTTP_SECURITY_NFT_V4_SET = "blocked_v4"
+_HTTP_SECURITY_NFT_V6_SET = "blocked_v6"
+_HTTP_SECURITY_CLEANUP_STARTED = False
+_HTTP_SECURITY_GEO_CACHE = {}
+_HTTP_SECURITY_GEO_CACHE_LOCK = threading.Lock()
+
+_HTTP_SECURITY_SENSITIVE_RE = re.compile(
+    r"(?:^|/)\.env(?:[./~_-]|$)|"
+    r"(?:^|/)\.(?:git|svn|hg|aws|ssh)(?:/|$)|"
+    r"(?:^|/)(?:wp-admin|wp-login\.php|phpmyadmin)(?:/|$)|"
+    r"(?:^|/)(?:credentials?|secrets?|config|settings?)(?:\.(?:json|ya?ml|ini|conf|php|py|js|bak|old|orig|save|zip|tar|gz)|/|$)|"
+    r"(?:^|/)(?:docker-?compose|compose)(?:\.[^/]+)?$|"
+    r"\.(?:bak|old|orig|save|swp|sql|sqlite|db)(?:$|[?#])",
+    re.IGNORECASE,
+)
 
 
-def _suspicious_4xx_client_ip() -> str:
-    """
-    Return the effective request IP.
+def _http_security_int(value, default, minimum, maximum):
+    try:
+        return max(minimum, min(maximum, int(value)))
+    except Exception:
+        return default
 
-    """
+
+def _http_security_normalize_networks(value):
+    if isinstance(value, str):
+        value = re.split(r"[\r\n,]+", value)
+    if not isinstance(value, list):
+        value = []
+
+    cleaned = []
+    for item in value:
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        try:
+            if "/" not in raw:
+                ip = ipaddress.ip_address(raw)
+                raw = f"{ip}/{32 if ip.version == 4 else 128}"
+            else:
+                raw = str(ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            continue
+        if raw not in cleaned:
+            cleaned.append(raw)
+    return cleaned
+
+
+def _load_http_security_settings():
+    # A before_request hook calls this for every request, static assets
+    # included, so re-reading and re-coercing the file each time is pure
+    # overhead. The mtime tells us when a save actually changed it.
+    try:
+        stamp = os.stat(_HTTP_SECURITY_SETTINGS_FILE).st_mtime_ns
+    except OSError:
+        stamp = 0
+
+    if _HTTP_SECURITY_SETTINGS_CACHE["stamp"] == stamp:
+        return dict(_HTTP_SECURITY_SETTINGS_CACHE["settings"])
+
+    raw = _json_load(_HTTP_SECURITY_SETTINGS_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+
+    settings = dict(_HTTP_SECURITY_DEFAULTS)
+    settings.update(raw)
+
+    settings["enabled"] = bool(settings.get("enabled", True))
+    settings["response_mode"] = (
+        "block" if str(settings.get("response_mode") or "").lower() == "block" else "monitor"
+    )
+    settings["ip_source"] = (
+        "effective" if str(settings.get("ip_source") or "").lower() == "effective" else "direct"
+    )
+    settings["block_scope"] = (
+        "auth_admin" if str(settings.get("block_scope") or "").lower() == "auth_admin" else "all"
+    )
+    settings["threshold"] = _http_security_int(settings.get("threshold"), 20, 3, 500)
+    settings["window_seconds"] = _http_security_int(settings.get("window_seconds"), 60, 10, 3600)
+    settings["sensitive_threshold"] = _http_security_int(settings.get("sensitive_threshold"), 3, 1, 50)
+    settings["rate_limit_threshold"] = _http_security_int(settings.get("rate_limit_threshold"), 10, 1, 200)
+    settings["login_threshold"] = _http_security_int(settings.get("login_threshold"), 5, 2, 100)
+    settings["login_window_seconds"] = _http_security_int(settings.get("login_window_seconds"), 600, 60, 86400)
+    settings["cooldown_seconds"] = _http_security_int(settings.get("cooldown_seconds"), 600, 30, 86400)
+    settings["block_seconds"] = _http_security_int(settings.get("block_seconds"), 900, 60, 604800)
+    settings["max_block_seconds"] = _http_security_int(settings.get("max_block_seconds"), 86400, 60, 2592000)
+    settings["max_block_seconds"] = max(settings["block_seconds"], settings["max_block_seconds"])
+    settings["escalate"] = bool(settings.get("escalate", True))
+    settings["enrich_ip"] = bool(settings.get("enrich_ip", False))
+    settings["firewall_enabled"] = bool(settings.get("firewall_enabled", False))
+    settings["firewall_after_offenses"] = _http_security_int(
+        settings.get("firewall_after_offenses"), 3, 1, 20
+    )
+    settings["trusted_networks"] = _http_security_normalize_networks(settings.get("trusted_networks"))
+    settings["deny_networks"] = _http_security_normalize_networks(settings.get("deny_networks"))
+
+    _HTTP_SECURITY_SETTINGS_CACHE.update(stamp=stamp, settings=dict(settings))
+    return settings
+
+
+def _save_http_security_settings(settings):
+    normalized = _load_http_security_settings()
+    normalized.update(settings or {})
+    _json_save(_HTTP_SECURITY_SETTINGS_FILE, normalized)
+    return _load_http_security_settings()
+
+
+def _http_security_normalize_ip(value):
+    value = str(value or "").strip()
+    if not value:
+        return "unknown"
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return "unknown"
+
+
+def _http_security_direct_ip():
+    original = request.environ.get("werkzeug.proxy_fix.orig") or {}
+    if isinstance(original, dict):
+        value = _http_security_normalize_ip(original.get("REMOTE_ADDR"))
+        if value != "unknown":
+            return value
+    return _http_security_normalize_ip(request.remote_addr)
+
+
+def _http_security_effective_ip():
     candidates = [
-        request.headers.get(
-            "CF-Connecting-IP"
-        ),
-        request.headers.get(
-            "True-Client-IP"
-        ),
-        request.headers.get(
-            "X-Real-IP"
-        ),
+        request.headers.get("CF-Connecting-IP"),
+        request.headers.get("True-Client-IP"),
+        request.headers.get("X-Real-IP"),
+        (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip(),
         request.remote_addr,
     ]
-
     for candidate in candidates:
-        value = str(
-            candidate or ""
-        ).strip()
-
-        if value:
-            return value[:128]
-
+        value = _http_security_normalize_ip(candidate)
+        if value != "unknown":
+            return value
     return "unknown"
 
 
-def _suspicious_4xx_ignored_path(
-    path: str,
-) -> bool:
-    """
-    Ignore routine asset and monitor paths.
+def _http_security_client_ip(settings=None):
+    settings = settings or _load_http_security_settings()
+    return (
+        _http_security_effective_ip()
+        if settings.get("ip_source") == "effective"
+        else _http_security_direct_ip()
+    )
 
-    Failed requests to application/API routes will be counted..
-    """
-    normalized = str(
-        path or ""
-    ).strip().lower()
 
-    if normalized.startswith(
-        "/static/"
-    ):
-        return True
-
-    if normalized in {
-        "/favicon.ico",
-        "/robots.txt",
-        "/api/healthz",
-        "/api/telegram/heartbeat",
-    }:
-        return True
-
+def _http_security_network_contains(client_ip, networks):
+    try:
+        address = ipaddress.ip_address(str(client_ip).strip())
+    except ValueError:
+        return False
+    for value in networks or []:
+        try:
+            if address in ipaddress.ip_network(value, strict=False):
+                return True
+        except ValueError:
+            continue
     return False
 
 
-def _record_suspicious_4xx(
-    response,
-) -> None:
-    status_code = int(
-        getattr(
-            response,
-            "status_code",
-            0,
+def _http_security_is_trusted(client_ip, settings=None):
+    settings = settings or _load_http_security_settings()
+    return _http_security_network_contains(client_ip, settings.get("trusted_networks"))
+
+
+def _http_security_is_denied(client_ip, settings=None):
+    settings = settings or _load_http_security_settings()
+    return _http_security_network_contains(client_ip, settings.get("deny_networks"))
+
+
+def _http_security_temp_allows_locked(state, now=None):
+    now = int(now or time.time())
+    rows = state.get("temporary_allow") if isinstance(state, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    active = []
+    changed = False
+    for row in rows:
+        if not isinstance(row, dict):
+            changed = True
+            continue
+        network = str(row.get("network") or "").strip()
+        expires_at = int(row.get("expires_at") or 0)
+        if not network or expires_at <= now:
+            changed = True
+            continue
+        active.append({"network": network, "expires_at": expires_at})
+    if changed:
+        state["temporary_allow"] = active
+    return active
+
+
+def _http_security_is_temporarily_allowed(client_ip, state=None, now=None):
+    now = int(now or time.time())
+    if state is None:
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    rows = _http_security_temp_allows_locked(state if isinstance(state, dict) else {}, now)
+    return _http_security_network_contains(client_ip, [row.get("network") for row in rows])
+
+
+def _suspicious_4xx_ignored_path(path):
+    normalized = str(path or "").strip().lower()
+    if normalized.startswith("/static/"):
+        return True
+    return normalized in {
+        "/favicon.ico", "/robots.txt", "/api/healthz", "/api/telegram/heartbeat"
+    }
+
+
+def _http_security_sensitive_path(path):
+    return bool(_HTTP_SECURITY_SENSITIVE_RE.search(str(path or "")))
+
+
+def _http_security_classify(path, status_code=None):
+    p = str(path or "").lower()
+    if int(status_code or 0) == 429:
+        return "rate_limit"
+    if re.search(r"(?:^|/)\.env(?:[./~_-]|$)", p):
+        return "environment_scan"
+    if re.search(r"(?:^|/)\.(?:git|svn|hg)(?:/|$)", p):
+        return "repository_scan"
+    if re.search(r"(?:wp-admin|wp-login\.php|phpmyadmin)", p):
+        return "admin_scanner"
+    if re.search(r"(?:credentials?|secrets?|config|settings?)", p):
+        return "credential_config_scan"
+    if re.search(r"\.(?:bak|old|orig|save|swp|sql|sqlite|db)(?:$|[?#])", p):
+        return "backup_database_scan"
+    return "generic_4xx"
+
+
+def _http_security_scope_applies(path, scope):
+    if scope != "auth_admin":
+        return True
+    p = str(path or "").lower()
+    prefixes = (
+        "/login", "/logout", "/register", "/settings", "/users", "/nodes",
+        "/logs", "/backup", "/api/", "/admin",
+    )
+    return p.startswith(prefixes)
+
+
+def _http_security_add_history_locked(state, *, event_type, ip="", category="", action="", reason="", path="", status=0, details=None, now=None):
+    now = int(now or time.time())
+    history = state.get("history")
+    if not isinstance(history, list):
+        history = []
+    row = {
+        "ts": now,
+        "type": str(event_type or "event")[:48],
+        "ip": _http_security_normalize_ip(ip) if ip else "",
+        "category": str(category or "")[:64],
+        "action": str(action or "")[:64],
+        "reason": str(reason or "")[:320],
+        "path": str(path or "")[:300],
+        "status": int(status or 0),
+        "details": details if isinstance(details, dict) else {},
+    }
+    history.append(row)
+    state["history"] = history[-_HTTP_SECURITY_HISTORY_LIMIT:]
+    return row
+
+
+def _http_security_stat_add_locked(state, now, ip, **counts):
+    buckets = state.get("stats_hours")
+    if not isinstance(buckets, dict):
+        buckets = {}
+    hour = str((int(now) // 3600) * 3600)
+    bucket = buckets.get(hour)
+    if not isinstance(bucket, dict):
+        bucket = {"ips": []}
+    for key, value in counts.items():
+        bucket[key] = int(bucket.get(key) or 0) + int(value or 0)
+    normalized_ip = _http_security_normalize_ip(ip)
+    ips = bucket.get("ips")
+    if not isinstance(ips, list):
+        ips = []
+    if normalized_ip != "unknown" and normalized_ip not in ips and len(ips) < 1000:
+        ips.append(normalized_ip)
+    bucket["ips"] = ips
+    buckets[hour] = bucket
+    cutoff = int(now) - (72 * 3600)
+    for key in list(buckets.keys()):
+        try:
+            if int(key) < cutoff:
+                buckets.pop(key, None)
+        except Exception:
+            buckets.pop(key, None)
+    state["stats_hours"] = buckets
+
+
+def _http_security_stats_24h(state=None, now=None):
+    now = int(now or time.time())
+    if state is None:
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    buckets = state.get("stats_hours") if isinstance(state, dict) else {}
+    if not isinstance(buckets, dict):
+        buckets = {}
+    totals = {
+        "rejected": 0,
+        "sensitive": 0,
+        "blocks": 0,
+        "monitor_triggers": 0,
+        "releases": 0,
+        "login_failures": 0,
+        "rate_limited": 0,
+        "unique_ips": 0,
+    }
+    ips = set()
+    cutoff = now - 86400
+    for key, bucket in buckets.items():
+        try:
+            if int(key) < cutoff or not isinstance(bucket, dict):
+                continue
+        except Exception:
+            continue
+        for name in ("rejected", "sensitive", "blocks", "monitor_triggers", "releases", "login_failures", "rate_limited"):
+            totals[name] += int(bucket.get(name) or 0)
+        for value in bucket.get("ips") or []:
+            if _http_security_normalize_ip(value) != "unknown":
+                ips.add(str(value))
+    totals["unique_ips"] = len(ips)
+    return totals
+
+
+def _http_security_geo(ip, settings=None):
+    settings = settings or _load_http_security_settings()
+    if not settings.get("enrich_ip"):
+        return {}
+    ip = _http_security_normalize_ip(ip)
+    if ip == "unknown":
+        return {}
+    try:
+        address = ipaddress.ip_address(ip)
+        if not address.is_global:
+            return {}
+    except Exception:
+        return {}
+
+    now = time.time()
+    with _HTTP_SECURITY_GEO_CACHE_LOCK:
+        cached = _HTTP_SECURITY_GEO_CACHE.get(ip)
+        if isinstance(cached, dict) and now - float(cached.get("_ts") or 0) < 86400:
+            return {k: v for k, v in cached.items() if k != "_ts"}
+
+    result = {}
+    try:
+        response = requests.get(f"https://ipwho.is/{ip}", timeout=3)
+        if response.ok:
+            payload = response.json() or {}
+            if payload.get("success", True):
+                connection = payload.get("connection") or {}
+                result = {
+                    "country": str(payload.get("country") or "")[:80],
+                    "country_code": str(payload.get("country_code") or "")[:8],
+                    "asn": str(connection.get("asn") or "")[:40],
+                    "provider": str(connection.get("isp") or connection.get("org") or "")[:120],
+                }
+    except Exception:
+        result = {}
+
+    with _HTTP_SECURITY_GEO_CACHE_LOCK:
+        _HTTP_SECURITY_GEO_CACHE[ip] = {"_ts": now, **result}
+        if len(_HTTP_SECURITY_GEO_CACHE) > 500:
+            oldest = sorted(_HTTP_SECURITY_GEO_CACHE.items(), key=lambda item: float((item[1] or {}).get("_ts") or 0))[:100]
+            for key, _ in oldest:
+                _HTTP_SECURITY_GEO_CACHE.pop(key, None)
+    return result
+
+
+def _http_security_nft_install_command():
+    if shutil.which("apt-get"):
+        return "sudo apt-get update && sudo apt-get install -y nftables"
+    if shutil.which("dnf"):
+        return "sudo dnf install -y nftables"
+    if shutil.which("yum"):
+        return "sudo yum install -y nftables"
+    if shutil.which("pacman"):
+        return "sudo pacman -S --needed nftables"
+    return "Install the nftables package with your operating system package manager."
+
+
+def _http_security_nft_status(settings=None):
+    nft = shutil.which("nft")
+    configured = bool((settings or {}).get("firewall_enabled")) if isinstance(settings, dict) else None
+
+    base = {
+        "backend": "nftables",
+        "available": bool(nft),
+        "usable": False,
+        "privileged": False,
+        "configured": configured,
+        "effective": False,
+        "table": _HTTP_SECURITY_NFT_TABLE,
+        "reason": "not_installed" if not nft else "checking",
+        "detail": "",
+        "install_command": _http_security_nft_install_command(),
+        "check_command": "sudo nft list ruleset",
+        "automatic_install": False,
+    }
+
+    if not nft:
+        base["detail"] = (
+            "The nft executable was not found. "
+            "Application-level blocking is still active."
         )
-        or 0
-    )
-
-    if status_code not in _HTTP_4XX_STATUSES:
-        return
-
-    request_path = str(
-        request.path or ""
-    )
-
-    if _suspicious_4xx_ignored_path(
-        request_path
-    ):
-        return
-
-    if not _tg_event_enabled(
-        "suspicious_4xx"
-    ):
-        return
-
-    client_ip = (
-        _suspicious_4xx_client_ip()
-    )
-
-    current_epoch = int(
-        time.time()
-    )
-
-    lock_handle = None
-    should_notify = False
-    request_count = 0
-    status_counts = {}
-    recent_paths = []
+        return base
 
     try:
-        lock_handle = open(
-            _HTTP_4XX_LOCK_FILE,
-            "a+",
+        proc = subprocess.run(
+            [nft, "list", "ruleset"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+            check=False,
         )
+    except Exception as exc:
+        base["reason"] = "check_failed"
+        base["detail"] = str(exc)[:300]
+        return base
 
-        fcntl.flock(
-            lock_handle.fileno(),
-            fcntl.LOCK_EX,
+    if proc.returncode == 0:
+        base["usable"] = True
+        base["privileged"] = True
+        base["reason"] = "ready"
+        base["detail"] = (
+            "WG Panel can read/manage nftables through "
+            "the current service permissions."
         )
-
-        state = _json_load(
-            _HTTP_4XX_STATE_FILE,
-            {},
+        base["effective"] = (
+            bool(configured)
+            if configured is not None
+            else False
         )
+        return base
 
-        if not isinstance(
-            state,
-            dict,
-        ):
+    detail = (
+        proc.stderr
+        or "nft list ruleset failed"
+    ).strip()[:300]
+
+    low = detail.lower()
+
+    base["reason"] = (
+        "permission_denied"
+        if (
+            "operation not permitted" in low
+            or "permission denied" in low
+            or "must be root" in low
+        )
+        else "unusable"
+    )
+    base["detail"] = detail
+
+    return base
+
+
+
+def _http_security_nft_run_script(script):
+    status = _http_security_nft_status()
+    nft = shutil.which("nft")
+    if not status.get("usable") or not nft:
+        return False, "nftables is unavailable or the panel process lacks root/CAP_NET_ADMIN"
+    try:
+        proc = subprocess.run(
+            [nft, "-f", "-"],
+            input=str(script),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=4,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout or "nft failed").strip()[:300]
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)[:300]
+
+
+def _http_security_nft_ensure():
+    status = _http_security_nft_status()
+    nft = shutil.which("nft")
+    if not status.get("usable") or not nft:
+        return False, "nftables is unavailable or the panel process lacks root/CAP_NET_ADMIN"
+    check = subprocess.run(
+        [nft, "list", "table", "inet", _HTTP_SECURITY_NFT_TABLE],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    if check.returncode == 0:
+        return True, ""
+    script = f"""
+table inet {_HTTP_SECURITY_NFT_TABLE} {{
+    set {_HTTP_SECURITY_NFT_V4_SET} {{ type ipv4_addr; flags timeout; }}
+    set {_HTTP_SECURITY_NFT_V6_SET} {{ type ipv6_addr; flags timeout; }}
+    chain input {{
+        type filter hook input priority -10; policy accept;
+        ip saddr @{_HTTP_SECURITY_NFT_V4_SET} drop
+        ip6 saddr @{_HTTP_SECURITY_NFT_V6_SET} drop
+    }}
+}}
+"""
+    return _http_security_nft_run_script(script)
+
+
+def _http_security_firewall_add(ip, seconds):
+    ip = _http_security_normalize_ip(ip)
+    if ip == "unknown":
+        return False, "invalid IP"
+    ok, detail = _http_security_nft_ensure()
+    if not ok:
+        return False, detail
+    version = ipaddress.ip_address(ip).version
+    set_name = _HTTP_SECURITY_NFT_V4_SET if version == 4 else _HTTP_SECURITY_NFT_V6_SET
+    seconds = _http_security_int(seconds, 900, 60, 2592000)
+    _http_security_nft_run_script(
+        f"delete element inet {_HTTP_SECURITY_NFT_TABLE} {set_name} {{ {ip} }}\n"
+    )
+    return _http_security_nft_run_script(
+        f"add element inet {_HTTP_SECURITY_NFT_TABLE} {set_name} {{ {ip} timeout {seconds}s }}\n"
+    )
+
+
+def _http_security_firewall_remove(ip):
+    ip = _http_security_normalize_ip(ip)
+    if ip == "unknown":
+        return False, "invalid IP"
+    status = _http_security_nft_status()
+    if not status.get("usable"):
+        return False, "nftables unavailable"
+    version = ipaddress.ip_address(ip).version
+    set_name = _HTTP_SECURITY_NFT_V4_SET if version == 4 else _HTTP_SECURITY_NFT_V6_SET
+    return _http_security_nft_run_script(
+        f"delete element inet {_HTTP_SECURITY_NFT_TABLE} {set_name} {{ {ip} }}\n"
+    )
+
+
+def _http_security_apply_block_locked(record, settings, now, reason):
+    current_block = int(record.get("blocked_until") or 0)
+    if current_block > now:
+        return False, 0, int(record.get("offenses") or 1)
+
+    last_offense = int(record.get("last_offense") or 0)
+    if last_offense and now - last_offense >= _HTTP_SECURITY_OFFENSE_RESET_SEC:
+        record["offenses"] = 0
+
+    offenses = max(0, int(record.get("offenses") or 0)) + 1
+    record["offenses"] = offenses
+    record["last_offense"] = now
+    multiplier = (2 ** max(0, offenses - 1)) if settings.get("escalate") else 1
+    block_seconds = min(settings["max_block_seconds"], settings["block_seconds"] * multiplier)
+    record["blocked_until"] = now + block_seconds
+    record["block_started_at"] = now
+    record["block_reason"] = reason
+    record["block_active"] = True
+    return True, block_seconds, offenses
+
+
+def _http_security_active_blocks(state=None, current_epoch=None, settings=None):
+    current_epoch = int(current_epoch or time.time())
+    settings = settings or _load_http_security_settings()
+    if state is None:
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    clients = state.get("clients") if isinstance(state, dict) else {}
+    if not isinstance(clients, dict):
+        clients = {}
+
+    rows = []
+    for ip, record in clients.items():
+        if not isinstance(record, dict):
+            continue
+        blocked_until = int(record.get("blocked_until") or 0)
+        if blocked_until <= current_epoch:
+            continue
+        rows.append({
+            "ip": ip,
+            "reason": str(record.get("block_reason") or "Threshold reached"),
+            "category": str(record.get("block_category") or ""),
+            "offenses": int(record.get("offenses") or 1),
+            "blocked_until": blocked_until,
+            "remaining_seconds": max(0, blocked_until - current_epoch),
+            "last_seen": int(record.get("last_seen") or 0),
+            "firewall": bool(record.get("firewall_active")),
+            "geo": _http_security_geo(ip, settings),
+        })
+    return sorted(rows, key=lambda row: row["blocked_until"], reverse=True)
+
+
+def _http_security_cleanup_expired(send_notifications=True):
+    now = int(time.time())
+    released = []
+    lock_handle = None
+    try:
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
             state = {}
-
-        clients = state.get(
-            "clients"
-        )
-
-        if not isinstance(
-            clients,
-            dict,
-        ):
+        _http_security_temp_allows_locked(state, now)
+        clients = state.get("clients")
+        if not isinstance(clients, dict):
             clients = {}
 
-        window_start = (
-            current_epoch
-            - _HTTP_4XX_WINDOW_SEC
-        )
-
-        # Remove stale IP records.
-        for old_ip, old_record in list(
-            clients.items()
-        ):
-            if not isinstance(
-                old_record,
-                dict,
-            ):
-                clients.pop(
-                    old_ip,
-                    None,
-                )
+        for ip, record in clients.items():
+            if not isinstance(record, dict):
                 continue
-
-            last_seen = int(
-                old_record.get(
-                    "last_seen"
+            blocked_until = int(record.get("blocked_until") or 0)
+            if blocked_until and blocked_until <= now and bool(record.get("block_active")):
+                reason = str(record.get("block_reason") or "Temporary block expired")
+                offenses = int(record.get("offenses") or 1)
+                record["block_active"] = False
+                record["blocked_until"] = 0
+                record["block_reason"] = ""
+                record["firewall_active"] = False
+                _http_security_stat_add_locked(state, now, ip, releases=1)
+                _http_security_add_history_locked(
+                    state,
+                    event_type="auto_release",
+                    ip=ip,
+                    category="release",
+                    action="auto_release",
+                    reason=reason,
+                    details={"offenses": offenses},
+                    now=now,
                 )
-                or 0
-            )
-
-            if (
-                current_epoch - last_seen
-                > max(
-                    _HTTP_4XX_COOLDOWN_SEC * 2,
-                    3600,
-                )
-            ):
-                clients.pop(
-                    old_ip,
-                    None,
-                )
-
-        record = clients.get(
-            client_ip
-        )
-
-        if not isinstance(
-            record,
-            dict,
-        ):
-            record = {
-                "events": [],
-                "last_alert": 0,
-                "last_seen": 0,
-            }
-
-        events = record.get(
-            "events"
-        )
-
-        if not isinstance(
-            events,
-            list,
-        ):
-            events = []
-
-        cleaned_events = []
-
-        for event_record in events:
-            if not isinstance(
-                event_record,
-                dict,
-            ):
-                continue
-
-            event_time = int(
-                event_record.get(
-                    "ts"
-                )
-                or 0
-            )
-
-            if event_time >= window_start:
-                cleaned_events.append(
-                    event_record
-                )
-
-        cleaned_events.append({
-            "ts": current_epoch,
-            "status": status_code,
-            "path": request_path[:240],
-            "method": str(
-                request.method or ""
-            )[:16],
-        })
-
-        cleaned_events = (
-            cleaned_events[-200:]
-        )
-
-        record["events"] = (
-            cleaned_events
-        )
-        record["last_seen"] = (
-            current_epoch
-        )
-
-        request_count = len(
-            cleaned_events
-        )
-
-        for event_record in cleaned_events:
-            status_text = str(
-                event_record.get(
-                    "status"
-                )
-                or "unknown"
-            )
-
-            status_counts[
-                status_text
-            ] = (
-                status_counts.get(
-                    status_text,
-                    0,
-                )
-                + 1
-            )
-
-        recent_paths = []
-
-        for event_record in reversed(
-            cleaned_events
-        ):
-            path_value = str(
-                event_record.get(
-                    "path"
-                )
-                or ""
-            ).strip()
-
-            if (
-                path_value
-                and path_value
-                not in recent_paths
-            ):
-                recent_paths.append(
-                    path_value
-                )
-
-            if len(recent_paths) >= 5:
-                break
-
-        last_alert = int(
-            record.get(
-                "last_alert"
-            )
-            or 0
-        )
-
-        if (
-            request_count
-            >= _HTTP_4XX_THRESHOLD
-            and (
-                current_epoch - last_alert
-                >= _HTTP_4XX_COOLDOWN_SEC
-            )
-        ):
-            should_notify = True
-            record["last_alert"] = (
-                current_epoch
-            )
-
-        clients[client_ip] = record
-
+                released.append((ip, reason, offenses))
         state["clients"] = clients
-        state["updated_at"] = (
-            current_epoch
-        )
-
-        _json_save(
-            _HTTP_4XX_STATE_FILE,
-            state,
-        )
-
+        state["updated_at"] = now
+        _json_save(_HTTP_4XX_STATE_FILE, state)
     except Exception:
-        app.logger.debug(
-            "Suspicious 4xx tracker failed",
-            exc_info=True,
-        )
-
+        app.logger.debug("HTTP security expiry cleanup failed", exc_info=True)
     finally:
         if lock_handle:
             try:
-                fcntl.flock(
-                    lock_handle.fileno(),
-                    fcntl.LOCK_UN,
-                )
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
             except Exception:
                 pass
-
             try:
                 lock_handle.close()
             except Exception:
                 pass
 
-    if not should_notify:
+    if send_notifications:
+        for ip, reason, offenses in released:
+            _send_telegram_event(
+                "security_auto_release",
+                "◇ HTTP security block expired",
+                status="Automatically released",
+                details=[
+                    ("Client IP", ip),
+                    ("Previous reason", reason),
+                    ("Offense level", offenses),
+                ],
+                dedupe_key=f"security-auto-release:{ip}:{now}",
+                dedupe_seconds=0,
+            )
+    return released
+
+
+def _http_security_cleanup_loop():
+    while True:
+        try:
+            with app.app_context():
+                _http_security_cleanup_expired(send_notifications=True)
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def _start_http_security_cleanup():
+    global _HTTP_SECURITY_CLEANUP_STARTED
+    if _HTTP_SECURITY_CLEANUP_STARTED:
+        return
+    _HTTP_SECURITY_CLEANUP_STARTED = True
+    threading.Thread(
+        target=_http_security_cleanup_loop,
+        name="http-security-cleanup",
+        daemon=True,
+    ).start()
+
+
+@app.before_request
+def _http_security_enforce_temporary_block():
+    settings = _load_http_security_settings()
+    if not settings.get("enabled"):
+        return None
+
+    client_ip = _http_security_client_ip(settings)
+    if client_ip == "unknown":
+        return None
+
+    # A permanent deny is deliberately stronger than all allow/temporary rules.
+    if _http_security_is_denied(client_ip, settings):
+        g.http_security_blocked = True
+        return make_response(jsonify(
+            ok=False,
+            error="permanently_blocked",
+            message="This client is denied by the panel security policy.",
+        ), 403)
+
+    state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    if _http_security_is_trusted(client_ip, settings):
+        return None
+    if _http_security_is_temporarily_allowed(client_ip, state=state):
+        return None
+    if settings.get("response_mode") != "block":
+        return None
+    if not _http_security_scope_applies(request.path, settings.get("block_scope")):
+        return None
+
+    clients = state.get("clients") if isinstance(state, dict) else {}
+    record = clients.get(client_ip) if isinstance(clients, dict) else None
+    blocked_until = int((record or {}).get("blocked_until") or 0)
+    now = int(time.time())
+
+    if blocked_until <= now:
+        return None
+
+    g.http_security_blocked = True
+    retry_after = max(1, blocked_until - now)
+    response = make_response(jsonify(
+        ok=False,
+        error="temporarily_blocked",
+        message="This client is temporarily blocked by panel HTTP security.",
+        retry_after=retry_after,
+    ), 403)
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+def _record_suspicious_4xx(response):
+    if getattr(g, "http_security_blocked", False):
         return
 
-    status_summary = ", ".join(
-        f"{key}×{value}"
-        for key, value in sorted(
-            status_counts.items()
-        )
-    )
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code not in _HTTP_4XX_STATUSES:
+        return
 
-    path_summary = " | ".join(
-        recent_paths
-    )
+    request_path = str(request.path or "")
+    if _suspicious_4xx_ignored_path(request_path):
+        return
 
-    _send_telegram_event(
-        "suspicious_4xx",
-        "● Suspicious HTTP activity detected",
-        status="Threshold reached",
-        details=[
-            (
-                "Client IP",
-                client_ip,
-            ),
-            (
-                "Requests",
-                request_count,
-            ),
-            (
-                "Window seconds",
-                _HTTP_4XX_WINDOW_SEC,
-            ),
-            (
-                "Statuses",
-                status_summary,
-            ),
-            (
-                "Recent paths",
-                path_summary[:700],
-            ),
-            (
-                "Last method",
-                request.method,
-            ),
-            (
-                "User agent",
-                str(
-                    request.headers.get(
-                        "User-Agent"
-                    )
-                    or ""
-                )[:300],
-            ),
-        ],
-        dedupe_key=(
-            f"suspicious-4xx:{client_ip}"
-        ),
-        dedupe_seconds=(
-            _HTTP_4XX_COOLDOWN_SEC
-        ),
-    )
+    settings = _load_http_security_settings()
+    if not settings.get("enabled"):
+        return
 
-@app.after_request
-def _suspicious_4xx_after_request(
-    response,
-):
-    """
-    Record relevant 4xx responses
-    """
+    client_ip = _http_security_client_ip(settings)
+    if client_ip == "unknown":
+        return
+    if _http_security_is_denied(client_ip, settings):
+        return
+    state_snapshot = _json_load(_HTTP_4XX_STATE_FILE, {})
+    if _http_security_is_trusted(client_ip, settings) or _http_security_is_temporarily_allowed(client_ip, state_snapshot):
+        return
+
+    now = int(time.time())
+    window_start = now - settings["window_seconds"]
+    sensitive_now = _http_security_sensitive_path(request_path)
+    category_now = _http_security_classify(request_path, status_code)
+    lock_handle = None
+    should_alert = False
+    did_block = False
+    block_seconds = 0
+    offenses = 0
+    reason = ""
+    trigger_category = category_now
+    request_count = 0
+    sensitive_count = 0
+    rate_limit_count = 0
+    status_counts = {}
+    recent_paths = []
+    firewall_should_apply = False
+
     try:
-        _record_suspicious_4xx(
-            response
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        clients = state.get("clients")
+        if not isinstance(clients, dict):
+            clients = {}
+
+        _http_security_temp_allows_locked(state, now)
+        _http_security_stat_add_locked(
+            state, now, client_ip,
+            rejected=1,
+            sensitive=(1 if sensitive_now else 0),
+            rate_limited=(1 if status_code == 429 else 0),
         )
+
+        stale_after = max(settings["cooldown_seconds"] * 4, settings["max_block_seconds"] * 2, 86400)
+        for old_ip, old_record in list(clients.items()):
+            if not isinstance(old_record, dict):
+                clients.pop(old_ip, None)
+                continue
+            last_seen = int(old_record.get("last_seen") or 0)
+            blocked_until = int(old_record.get("blocked_until") or 0)
+            offenses_old = int(old_record.get("offenses") or 0)
+            if blocked_until <= now and offenses_old <= 0 and now - last_seen > stale_after:
+                clients.pop(old_ip, None)
+
+        record = clients.get(client_ip)
+        if not isinstance(record, dict):
+            record = {"events": [], "login_events": [], "last_alert": 0, "last_seen": 0, "offenses": 0}
+
+        events = record.get("events")
+        if not isinstance(events, list):
+            events = []
+        events = [event for event in events if isinstance(event, dict) and int(event.get("ts") or 0) >= window_start]
+        events.append({
+            "ts": now,
+            "status": status_code,
+            "path": request_path[:240],
+            "method": str(request.method or "")[:16],
+            "sensitive": bool(sensitive_now),
+            "category": category_now,
+        })
+        events = events[-300:]
+        record["events"] = events
+        record["last_seen"] = now
+
+        request_count = len(events)
+        sensitive_count = sum(1 for event in events if bool(event.get("sensitive")))
+        rate_limit_count = sum(1 for event in events if int(event.get("status") or 0) == 429)
+        for event in events:
+            key = str(event.get("status") or "unknown")
+            status_counts[key] = status_counts.get(key, 0) + 1
+        for event in reversed(events):
+            value = str(event.get("path") or "").strip()
+            if value and value not in recent_paths:
+                recent_paths.append(value)
+            if len(recent_paths) >= 5:
+                break
+
+        triggered_sensitive = sensitive_count >= settings["sensitive_threshold"]
+        triggered_rate = rate_limit_count >= settings["rate_limit_threshold"]
+        triggered_generic = request_count >= settings["threshold"]
+        triggered = triggered_sensitive or triggered_rate or triggered_generic
+        if triggered:
+            if triggered_sensitive:
+                trigger_category = category_now if sensitive_now else "sensitive_scan"
+                reason = f"Sensitive-path threshold reached ({sensitive_count}/{settings['sensitive_threshold']})"
+            elif triggered_rate:
+                trigger_category = "rate_limit"
+                reason = f"429 threshold reached ({rate_limit_count}/{settings['rate_limit_threshold']})"
+            else:
+                trigger_category = "generic_4xx"
+                reason = f"4xx threshold reached ({request_count}/{settings['threshold']})"
+
+            last_alert = int(record.get("last_alert") or 0)
+            if now - last_alert >= settings["cooldown_seconds"]:
+                should_alert = True
+                record["last_alert"] = now
+
+            if settings.get("response_mode") == "block":
+                did_block, block_seconds, offenses = _http_security_apply_block_locked(record, settings, now, reason)
+                if did_block:
+                    record["block_category"] = trigger_category
+                    should_alert = True
+                    record["last_alert"] = now
+                    _http_security_stat_add_locked(state, now, client_ip, blocks=1)
+                    _http_security_add_history_locked(
+                        state,
+                        event_type="block",
+                        ip=client_ip,
+                        category=trigger_category,
+                        action="temporary_block",
+                        reason=reason,
+                        path=request_path,
+                        status=status_code,
+                        details={"duration_seconds": block_seconds, "offenses": offenses},
+                        now=now,
+                    )
+                    firewall_should_apply = bool(
+                        settings.get("firewall_enabled")
+                        and offenses >= settings.get("firewall_after_offenses", 3)
+                    )
+            elif should_alert:
+                _http_security_stat_add_locked(state, now, client_ip, monitor_triggers=1)
+                _http_security_add_history_locked(
+                    state,
+                    event_type="monitor_trigger",
+                    ip=client_ip,
+                    category=trigger_category,
+                    action="monitor",
+                    reason=reason,
+                    path=request_path,
+                    status=status_code,
+                    details={"requests": request_count, "sensitive": sensitive_count, "rate_limited": rate_limit_count},
+                    now=now,
+                )
+
+        clients[client_ip] = record
+        state["clients"] = clients
+        state["updated_at"] = now
+        _json_save(_HTTP_4XX_STATE_FILE, state)
 
     except Exception:
-        app.logger.debug(
-            "Could not inspect 4xx response",
-            exc_info=True,
+        app.logger.debug("HTTP security tracker failed", exc_info=True)
+    finally:
+        if lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                lock_handle.close()
+            except Exception:
+                pass
+
+    firewall_detail = ""
+    if did_block and firewall_should_apply:
+        fw_ok, firewall_detail = _http_security_firewall_add(client_ip, block_seconds)
+        if fw_ok:
+            lock_handle = None
+            try:
+                lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                state = _json_load(_HTTP_4XX_STATE_FILE, {})
+                clients = state.get("clients") if isinstance(state, dict) else {}
+                if isinstance(clients, dict) and isinstance(clients.get(client_ip), dict):
+                    clients[client_ip]["firewall_active"] = True
+                    state["clients"] = clients
+                    _json_save(_HTTP_4XX_STATE_FILE, state)
+            finally:
+                if lock_handle:
+                    try:
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                    lock_handle.close()
+        else:
+            app.logger.warning("HTTP security nftables escalation failed for %s: %s", client_ip, firewall_detail)
+
+    if not should_alert:
+        return
+
+    event_key = "security_block" if did_block else "suspicious_4xx"
+    details = [
+        ("Client IP", client_ip),
+        ("Category", trigger_category.replace("_", " ").title()),
+        ("Requests", request_count),
+        ("Sensitive requests", sensitive_count),
+        ("429 responses", rate_limit_count),
+        ("Window", _tg_human_duration(settings["window_seconds"])),
+        ("Statuses", ", ".join(f"{k}×{v}" for k, v in sorted(status_counts.items()))),
+        ("Reason", reason or "Threshold reached"),
+        ("Action", (f"Blocked for {_tg_human_duration(block_seconds)}" if did_block else "Monitor only")),
+        ("Recent paths", " | ".join(recent_paths)[:700]),
+        ("Last method", request.method),
+        ("User agent", str(request.headers.get("User-Agent") or "")[:300]),
+    ]
+    if did_block and settings.get("firewall_enabled"):
+        details.append(("Host firewall", "Applied" if not firewall_detail else f"Not applied · {firewall_detail}"))
+    geo = _http_security_geo(client_ip, settings)
+    if geo:
+        details.append(("Network", " · ".join(filter(None, [geo.get("country_code"), geo.get("asn"), geo.get("provider")]))))
+
+    _send_telegram_event(
+        event_key,
+        "◆ Suspicious HTTP activity detected",
+        status=("Temporarily blocked" if did_block else "Threshold reached"),
+        details=details,
+        dedupe_key=f"http-security:{event_key}:{client_ip}",
+        dedupe_seconds=(0 if did_block else settings["cooldown_seconds"]),
+    )
+
+
+def _http_security_record_login_failure(username="", failure_type="credentials"):
+    settings = _load_http_security_settings()
+    if not settings.get("enabled"):
+        return
+    client_ip = _http_security_client_ip(settings)
+    if client_ip == "unknown" or _http_security_is_denied(client_ip, settings):
+        return
+    state_snapshot = _json_load(_HTTP_4XX_STATE_FILE, {})
+    if _http_security_is_trusted(client_ip, settings) or _http_security_is_temporarily_allowed(client_ip, state_snapshot):
+        return
+
+    now = int(time.time())
+    window_start = now - settings["login_window_seconds"]
+    lock_handle = None
+    should_alert = False
+    did_block = False
+    block_seconds = 0
+    offenses = 0
+    count = 0
+    reason = ""
+    firewall_should_apply = False
+
+    try:
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        clients = state.get("clients")
+        if not isinstance(clients, dict):
+            clients = {}
+        record = clients.get(client_ip)
+        if not isinstance(record, dict):
+            record = {"events": [], "login_events": [], "last_alert": 0, "last_seen": 0, "offenses": 0}
+
+        login_events = record.get("login_events")
+        if not isinstance(login_events, list):
+            login_events = []
+        login_events = [event for event in login_events if isinstance(event, dict) and int(event.get("ts") or 0) >= window_start]
+        login_events.append({
+            "ts": now,
+            "type": str(failure_type or "credentials")[:32],
+            "username": str(username or "")[:120],
+        })
+        login_events = login_events[-200:]
+        record["login_events"] = login_events
+        record["last_seen"] = now
+        count = len(login_events)
+        _http_security_stat_add_locked(state, now, client_ip, login_failures=1)
+
+        if count >= settings["login_threshold"]:
+            reason = f"Login-failure threshold reached ({count}/{settings['login_threshold']})"
+            last_alert = int(record.get("last_login_alert") or 0)
+            if now - last_alert >= settings["cooldown_seconds"]:
+                should_alert = True
+                record["last_login_alert"] = now
+
+            if settings.get("response_mode") == "block":
+                did_block, block_seconds, offenses = _http_security_apply_block_locked(record, settings, now, reason)
+                if did_block:
+                    record["block_category"] = "auth_bruteforce"
+                    should_alert = True
+                    record["last_login_alert"] = now
+                    _http_security_stat_add_locked(state, now, client_ip, blocks=1)
+                    _http_security_add_history_locked(
+                        state,
+                        event_type="block",
+                        ip=client_ip,
+                        category="auth_bruteforce",
+                        action="temporary_block",
+                        reason=reason,
+                        details={"duration_seconds": block_seconds, "offenses": offenses, "username": str(username or "")[:120]},
+                        now=now,
+                    )
+                    firewall_should_apply = bool(
+                        settings.get("firewall_enabled")
+                        and offenses >= settings.get("firewall_after_offenses", 3)
+                    )
+            elif should_alert:
+                _http_security_stat_add_locked(state, now, client_ip, monitor_triggers=1)
+                _http_security_add_history_locked(
+                    state,
+                    event_type="login_trigger",
+                    ip=client_ip,
+                    category="auth_bruteforce",
+                    action="monitor",
+                    reason=reason,
+                    details={"username": str(username or "")[:120], "count": count},
+                    now=now,
+                )
+
+        clients[client_ip] = record
+        state["clients"] = clients
+        state["updated_at"] = now
+        _json_save(_HTTP_4XX_STATE_FILE, state)
+    except Exception:
+        app.logger.debug("HTTP security login tracker failed", exc_info=True)
+    finally:
+        if lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_handle.close()
+
+    firewall_detail = ""
+    if did_block and firewall_should_apply:
+        fw_ok, firewall_detail = _http_security_firewall_add(client_ip, block_seconds)
+        if not fw_ok:
+            app.logger.warning("HTTP security nftables escalation failed for login offender %s: %s", client_ip, firewall_detail)
+
+    if should_alert:
+        _send_telegram_event(
+            "security_block" if did_block else "suspicious_4xx",
+            "◆ Repeated authentication failures",
+            status=("Temporarily blocked" if did_block else "Threshold reached"),
+            details=[
+                ("Client IP", client_ip),
+                ("Account", username or "unknown"),
+                ("Failures", count),
+                ("Window", _tg_human_duration(settings["login_window_seconds"])),
+                ("Reason", reason),
+                ("Action", f"Blocked for {_tg_human_duration(block_seconds)}" if did_block else "Monitor only"),
+                ("Host firewall", "Requested" if did_block and firewall_should_apply else "Application only"),
+            ],
+            dedupe_key=f"security-login-threshold:{client_ip}",
+            dedupe_seconds=(0 if did_block else settings["cooldown_seconds"]),
         )
 
+
+@app.after_request
+def _suspicious_4xx_after_request(response):
+    try:
+        _record_suspicious_4xx(response)
+    except Exception:
+        app.logger.debug("Could not inspect 4xx response", exc_info=True)
     return response
+
+@app.get('/api/security/http-protection/capabilities')
+@login_required
+def http_security_capabilities_get():
+    settings = _load_http_security_settings()
+
+    return jsonify(
+        ok=True,
+        firewall=_http_security_nft_status(settings),
+        geo={
+            "enabled": bool(settings.get("enrich_ip")),
+            "provider": "ipwho.is",
+            "external_lookup": True,
+            "display_only": True,
+            "cache_seconds": 86400,
+        },
+    )
+
+
+
+@app.get('/api/security/http-protection')
+@require_api_key_or_login
+def http_security_settings_get():
+    _http_security_cleanup_expired(send_notifications=True)
+    settings = _load_http_security_settings()
+    state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    temporary_allow = _http_security_temp_allows_locked(state if isinstance(state, dict) else {})
+    return jsonify(
+        ok=True,
+        settings=settings,
+        active_blocks=_http_security_active_blocks(state, settings=settings),
+        temporary_allow=temporary_allow,
+        stats_24h=_http_security_stats_24h(state),
+        firewall=_http_security_nft_status(settings),
+    )
+
+
+@app.post('/api/security/http-protection')
+@require_api_key_or_login
+def http_security_settings_post():
+    payload = request.get_json(silent=True) or {}
+    allowed = {
+        "enabled", "response_mode", "ip_source", "block_scope", "threshold", "window_seconds",
+        "sensitive_threshold", "rate_limit_threshold", "login_threshold", "login_window_seconds",
+        "cooldown_seconds", "block_seconds", "max_block_seconds", "escalate", "enrich_ip",
+        "firewall_enabled", "firewall_after_offenses", "trusted_networks", "deny_networks",
+    }
+    partial = {key: payload[key] for key in allowed if key in payload}
+
+    if "response_mode" in partial and str(partial["response_mode"]).lower() not in {"monitor", "block"}:
+        return jsonify(ok=False, error="invalid_response_mode"), 400
+    if "ip_source" in partial and str(partial["ip_source"]).lower() not in {"direct", "effective"}:
+        return jsonify(ok=False, error="invalid_ip_source"), 400
+    if "block_scope" in partial and str(partial["block_scope"]).lower() not in {"all", "auth_admin"}:
+        return jsonify(ok=False, error="invalid_block_scope"), 400
+
+    for key in ("trusted_networks", "deny_networks"):
+        if key not in partial:
+            continue
+        raw_values = partial[key]
+        if isinstance(raw_values, str):
+            raw_values = re.split(r"[\r\n,]+", raw_values)
+        if not isinstance(raw_values, list):
+            return jsonify(ok=False, error=f"invalid_{key}"), 400
+        checked = []
+        for item in raw_values:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            try:
+                if "/" not in value:
+                    ip = ipaddress.ip_address(value)
+                    value = f"{ip}/{32 if ip.version == 4 else 128}"
+                else:
+                    value = str(ipaddress.ip_network(value, strict=False))
+            except ValueError:
+                return jsonify(ok=False, error="invalid_network", field=key, value=value), 400
+            if value not in checked:
+                checked.append(value)
+        partial[key] = checked
+
+    proposed = _load_http_security_settings()
+    proposed.update(partial)
+    proposed["trusted_networks"] = _http_security_normalize_networks(proposed.get("trusted_networks"))
+    proposed["deny_networks"] = _http_security_normalize_networks(proposed.get("deny_networks"))
+
+    current_ip = _http_security_client_ip(proposed)
+    if current_ip != "unknown" and _http_security_network_contains(current_ip, proposed.get("deny_networks")):
+        return jsonify(
+            ok=False,
+            error="would_block_current_admin",
+            message="The permanent deny list contains your current client IP. Remove it before saving.",
+            ip=current_ip,
+        ), 409
+
+    # Host-firewall escalation is optional. Never persist it as enabled when
+    # this process cannot actually use nftables. The Flask application-level
+    # blocker remains fully functional either way.
+    if bool(proposed.get("firewall_enabled")):
+        firewall_status = _http_security_nft_status(proposed)
+
+        if not firewall_status.get("usable"):
+            return jsonify(
+                ok=False,
+                error="nftables_unavailable",
+                message=(
+                    "Host-firewall escalation cannot be enabled because nftables "
+                    "is unavailable to the WG Panel service. Application-level "
+                    "blocking is still active."
+                ),
+                firewall=firewall_status,
+            ), 409
+
+    _json_save(_HTTP_SECURITY_SETTINGS_FILE, proposed)
+    settings = _load_http_security_settings()
+
+    state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    return jsonify(
+        ok=True,
+        settings=settings,
+        active_blocks=_http_security_active_blocks(state, settings=settings),
+        temporary_allow=_http_security_temp_allows_locked(state if isinstance(state, dict) else {}),
+        stats_24h=_http_security_stats_24h(state),
+        firewall=_http_security_nft_status(settings),
+    )
+
+
+@app.post('/api/security/http-protection/unban')
+@require_api_key_or_login
+def http_security_unban():
+    payload = request.get_json(silent=True) or {}
+    client_ip = _http_security_normalize_ip(payload.get("ip"))
+    if client_ip == "unknown":
+        return jsonify(ok=False, error="invalid_ip"), 400
+
+    now = int(time.time())
+    released = False
+    reason = ""
+    offenses = 0
+    lock_handle = None
+    try:
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        clients = state.get("clients")
+        if not isinstance(clients, dict):
+            clients = {}
+        record = clients.get(client_ip)
+        if isinstance(record, dict):
+            released = int(record.get("blocked_until") or 0) > now
+            reason = str(record.get("block_reason") or "")
+            offenses = int(record.get("offenses") or 0)
+            record["blocked_until"] = 0
+            record["block_active"] = False
+            record["block_reason"] = ""
+            record["firewall_active"] = False
+            record["events"] = []
+            clients[client_ip] = record
+        if released:
+            _http_security_stat_add_locked(state, now, client_ip, releases=1)
+            _http_security_add_history_locked(
+                state,
+                event_type="manual_release",
+                ip=client_ip,
+                category="release",
+                action="manual_release",
+                reason=reason or "Released by administrator",
+                details={"offenses": offenses},
+                now=now,
+            )
+        state["clients"] = clients
+        state["updated_at"] = now
+        _json_save(_HTTP_4XX_STATE_FILE, state)
+    finally:
+        if lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_handle.close()
+
+    _http_security_firewall_remove(client_ip)
+    if released:
+        _send_telegram_event(
+            "security_release",
+            "◇ HTTP security block released",
+            status="Manually released",
+            details=[("Client IP", client_ip), ("Previous reason", reason or "Temporary block"), ("Offense level", offenses)],
+            dedupe_key=f"security-manual-release:{client_ip}:{now}",
+            dedupe_seconds=0,
+        )
+
+    return jsonify(ok=True, ip=client_ip, active_blocks=_http_security_active_blocks())
+
+
+@app.get('/api/security/http-protection/events')
+@require_api_key_or_login
+def http_security_events_get():
+    settings = _load_http_security_settings()
+    state = _json_load(_HTTP_4XX_STATE_FILE, {})
+    history = state.get("history") if isinstance(state, dict) else []
+    if not isinstance(history, list):
+        history = []
+
+    event_type = str(request.args.get("type") or "").strip().lower()
+    category = str(request.args.get("category") or "").strip().lower()
+    ip_filter = str(request.args.get("ip") or "").strip()
+    limit = _http_security_int(request.args.get("limit"), 150, 1, 500)
+
+    rows = []
+    for row in reversed(history):
+        if not isinstance(row, dict):
+            continue
+        if event_type and str(row.get("type") or "").lower() != event_type:
+            continue
+        if category and str(row.get("category") or "").lower() != category:
+            continue
+        if ip_filter and ip_filter not in str(row.get("ip") or ""):
+            continue
+        item = dict(row)
+        if settings.get("enrich_ip") and item.get("ip"):
+            item["geo"] = _http_security_geo(item.get("ip"), settings)
+        rows.append(item)
+        if len(rows) >= limit:
+            break
+
+    return jsonify(ok=True, events=rows, stats_24h=_http_security_stats_24h(state))
+
+
+@app.delete('/api/security/http-protection/events')
+@login_required
+def http_security_events_clear():
+    lock_handle = None
+    try:
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        state["history"] = []
+        state["updated_at"] = int(time.time())
+        _json_save(_HTTP_4XX_STATE_FILE, state)
+    finally:
+        if lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_handle.close()
+    return jsonify(ok=True)
+
+
+@app.post('/api/security/http-protection/temporary-allow')
+@login_required
+def http_security_temporary_allow_add():
+    payload = request.get_json(silent=True) or {}
+    raw = str(payload.get("network") or "").strip()
+    duration = _http_security_int(payload.get("duration_seconds"), 3600, 60, _HTTP_SECURITY_TEMP_ALLOW_MAX_SEC)
+    normalized = _http_security_normalize_networks([raw])
+    if not normalized:
+        return jsonify(ok=False, error="invalid_network"), 400
+    network = normalized[0]
+    now = int(time.time())
+    expires_at = now + duration
+
+    lock_handle = None
+    try:
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        rows = _http_security_temp_allows_locked(state, now)
+        rows = [row for row in rows if str(row.get("network")) != network]
+        rows.append({"network": network, "expires_at": expires_at})
+        state["temporary_allow"] = rows
+        _http_security_add_history_locked(
+            state,
+            event_type="temporary_allow",
+            category="access_list",
+            action="allow",
+            reason=f"Temporary allow added for {_tg_human_duration(duration)}",
+            details={"network": network, "expires_at": expires_at},
+            now=now,
+        )
+        _json_save(_HTTP_4XX_STATE_FILE, state)
+    finally:
+        if lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_handle.close()
+    return jsonify(ok=True, network=network, expires_at=expires_at, temporary_allow=_http_security_temp_allows_locked(_json_load(_HTTP_4XX_STATE_FILE, {})))
+
+
+@app.post('/api/security/http-protection/temporary-allow/remove')
+@login_required
+def http_security_temporary_allow_remove():
+    payload = request.get_json(silent=True) or {}
+    normalized = _http_security_normalize_networks([payload.get("network")])
+    if not normalized:
+        return jsonify(ok=False, error="invalid_network"), 400
+    network = normalized[0]
+    now = int(time.time())
+    lock_handle = None
+    try:
+        lock_handle = open(_HTTP_4XX_LOCK_FILE, "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state = _json_load(_HTTP_4XX_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        rows = _http_security_temp_allows_locked(state, now)
+        state["temporary_allow"] = [row for row in rows if str(row.get("network")) != network]
+        _http_security_add_history_locked(
+            state,
+            event_type="temporary_allow_removed",
+            category="access_list",
+            action="remove_allow",
+            reason="Temporary allow removed",
+            details={"network": network},
+            now=now,
+        )
+        _json_save(_HTTP_4XX_STATE_FILE, state)
+    finally:
+        if lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_handle.close()
+    return jsonify(ok=True, network=network, temporary_allow=_http_security_temp_allows_locked(_json_load(_HTTP_4XX_STATE_FILE, {})))
+
+
+_start_http_security_cleanup()
 
 # ==================================================
 # Node and WG interface notification monitor
@@ -2731,10 +4970,15 @@ def _local_notification_states() -> dict:
 def _check_local_notifications(
     state: dict,
 ) -> None:
-    local_key = '__local_interfaces__'
+
+    local_key = (
+        '__local_interfaces__'
+    )
 
     previous_interfaces = (
-        state.get(local_key)
+        state.get(
+            local_key
+        )
         or {}
     )
 
@@ -2742,75 +4986,213 @@ def _check_local_notifications(
         _local_notification_states()
     )
 
+    next_interfaces = {}
+
+    # Two consecutive monitor readings must agree before
+    # a state transition becomes official.
+    confirmation_checks = 2
+
     for interface_name, current in (
         current_interfaces.items()
     ):
-        current_up = bool(
-            current.get('is_up')
+        observed_up = bool(
+            current.get(
+                'is_up'
+            )
         )
 
-        old_record = (
+        previous = (
             previous_interfaces.get(
                 interface_name
             )
         )
 
-        if not isinstance(old_record, dict):
+        # First observation:
+        # establish state silently.
+        if not isinstance(
+            previous,
+            dict,
+        ):
+            next_interfaces[
+                interface_name
+            ] = {
+                'is_up': observed_up,
+                'pending_state': None,
+                'pending_checks': 0,
+                'address': (
+                    current.get(
+                        'address'
+                    )
+                    or ''
+                ),
+                'listen_port': (
+                    current.get(
+                        'listen_port'
+                    )
+                ),
+            }
+
             continue
 
-        previous_up = bool(
-            old_record.get('is_up')
+        confirmed_up = bool(
+            previous.get(
+                'is_up'
+            )
         )
 
-        if previous_up and not current_up:
-            _send_telegram_event(
-                'iface_down',
-                '● WireGuard interface went down',
-                status='Down',
-                details=[
-                    ('Location', 'Local panel'),
-                    ('Interface', interface_name),
-                    (
-                        'Address',
-                        current.get('address'),
-                    ),
-                    (
-                        'Listen port',
-                        current.get('listen_port'),
-                    ),
-                ],
-                dedupe_key=(
-                    f'local-interface-down:'
-                    f'{interface_name}'
-                ),
-                dedupe_seconds=180,
+        pending_state = (
+            previous.get(
+                'pending_state'
             )
+        )
 
-        elif not previous_up and current_up:
-            _send_telegram_event(
-                'iface_up',
-                '● WireGuard interface came up',
-                status='Up',
-                details=[
-                    ('Location', 'Local panel'),
-                    ('Interface', interface_name),
-                    (
-                        'Address',
-                        current.get('address'),
-                    ),
-                    (
-                        'Listen port',
-                        current.get('listen_port'),
-                    ),
-                ],
-                dedupe_key=(
-                    f'local-interface-up:'
-                    f'{interface_name}'
-                ),
-                dedupe_seconds=60,
+        try:
+            pending_checks = int(
+                previous.get(
+                    'pending_checks'
+                )
+                or 0
             )
+        except Exception:
+            pending_checks = 0
 
-    state[local_key] = current_interfaces
+        if observed_up == confirmed_up:
+            pending_state = None
+            pending_checks = 0
+
+        else:
+            if (
+                pending_state
+                == observed_up
+            ):
+                pending_checks += 1
+
+            else:
+                pending_state = (
+                    observed_up
+                )
+
+                pending_checks = 1
+
+            if (
+                pending_checks
+                >= confirmation_checks
+            ):
+                old_up = confirmed_up
+
+                confirmed_up = (
+                    observed_up
+                )
+
+                pending_state = None
+                pending_checks = 0
+
+                if (
+                    old_up
+                    and not confirmed_up
+                ):
+                    _send_telegram_event(
+                        'iface_down',
+                        (
+                            'WireGuard interface '
+                            'went offline'
+                        ),
+                        status='Offline',
+                        details=[
+                            (
+                                'Location',
+                                'Local panel',
+                            ),
+                            (
+                                'Interface',
+                                interface_name,
+                            ),
+                            (
+                                'Address',
+                                current.get(
+                                    'address'
+                                ),
+                            ),
+                            (
+                                'Listen port',
+                                current.get(
+                                    'listen_port'
+                                ),
+                            ),
+                        ],
+                        dedupe_key=(
+                            'local-interface-down:'
+                            f'{interface_name}'
+                        ),
+                        dedupe_seconds=300,
+                    )
+
+                elif (
+                    not old_up
+                    and confirmed_up
+                ):
+                    _send_telegram_event(
+                        'iface_up',
+                        (
+                            'WireGuard interface '
+                            'came online'
+                        ),
+                        status='Online',
+                        details=[
+                            (
+                                'Location',
+                                'Local panel',
+                            ),
+                            (
+                                'Interface',
+                                interface_name,
+                            ),
+                            (
+                                'Address',
+                                current.get(
+                                    'address'
+                                ),
+                            ),
+                            (
+                                'Listen port',
+                                current.get(
+                                    'listen_port'
+                                ),
+                            ),
+                        ],
+                        dedupe_key=(
+                            'local-interface-up:'
+                            f'{interface_name}'
+                        ),
+                        dedupe_seconds=120,
+                    )
+
+        next_interfaces[
+            interface_name
+        ] = {
+            'is_up': confirmed_up,
+            'pending_state': (
+                pending_state
+            ),
+            'pending_checks': (
+                pending_checks
+            ),
+            'address': (
+                current.get(
+                    'address'
+                )
+                or ''
+            ),
+            'listen_port': (
+                current.get(
+                    'listen_port'
+                )
+            ),
+        }
+
+    state[
+        local_key
+    ] = next_interfaces
 
 
 def _check_node_notifications(
@@ -2879,7 +5261,6 @@ def _check_node_notifications(
                 )
 
                 if online_now:
-               # New node agents include interface state directly
                # in /api/health. avoid response
                     if isinstance(health,dict,):
                         health_interfaces = (health.get("interfaces"))
@@ -2887,7 +5268,7 @@ def _check_node_notifications(
                         if isinstance(health_interfaces,list,):
                             interfaces = (health_interfaces)
 
-                    # Compatibility fallback for older node agents
+                    # fallback for older node agents
                     if not interfaces:
                         try:
                             interface_response = (node_get(node,"/api/interfaces?fast=1",timeout=10,)or {})
@@ -2987,9 +5368,7 @@ def _check_node_notifications(
                         node.base_url,
                     ),
                     (
-                        'Outage seconds',
-                        outage_seconds,
-                    ),
+                    'Outage',_tg_human_duration(outage_seconds),),
                     (
                         'Remote host',
                         (
@@ -3711,60 +6090,37 @@ def _send_security_notification(
     username: str = '',
     reason: str = '',
 ) -> None:
+    """
+    Send panel login / 2FA security notifications
+
+    Supported event types:
+        login_success
+        login_failed
+        twofa_failed
+        - Telegram bot token
+        - Admin recipients
+        - Muted admins
+        - HTML escaping
+        - notification timestamp
+        - Background sending
+        - Deduplication
+
+    """
 
     if not _security_notify_enabled(
         event_type
     ):
         return
 
-    settings = _load_tg_settings()
-
-    bot_token = (
-        settings.get('bot_token')
-        or ''
-    ).strip()
-
-    recipients = [
-        str(admin.get('id') or '').strip()
-        for admin in (
-            _load_tg_admins()
-            or []
-        )
-        if (
-            str(
-                admin.get('id')
-                or ''
-            ).strip()
-            and not admin.get('muted')
-        )
-    ]
-
-    if not bot_token or not recipients:
-        return
-
+    # ----------------------------
+    # Request/client information
+    # ----------------------------
     client_ip, proxy_chain = (
         _request_client_ip()
     )
 
     device_summary, raw_user_agent = (
         _request_device_summary()
-    )
-
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        '%Y-%m-%d %H:%M:%S UTC'
-    )
-
-    panel_host = (
-        request.host
-        or 'unknown'
-    ).strip()
-
-    scheme = (
-        'HTTPS'
-        if _is_https()
-        else 'HTTP'
     )
 
     username = (
@@ -3777,172 +6133,159 @@ def _send_security_notification(
         or ''
     ).strip()[:300]
 
-    if event_type != 'login_success':
-        deduplication_key = (
-            event_type,
-            client_ip,
-            username,
-            reason,
-        )
+    client_ip = (
+        client_ip
+        or 'unknown'
+    ).strip()[:128]
 
-        current_time = time.monotonic()
+    proxy_chain = (
+        proxy_chain
+        or ''
+    ).strip()[:400]
 
-        with _SECURITY_NOTIFY_LOCK:
-            previous_time = float(
-                _SECURITY_NOTIFY_LAST.get(
-                    deduplication_key
-                )
-                or 0
-            )
+    device_summary = (
+        device_summary
+        or 'Unknown device'
+    ).strip()[:200]
 
-            if (
-                current_time
-                - previous_time
-                < 10
-            ):
-                return
+    raw_user_agent = (
+        raw_user_agent
+        or ''
+    ).strip()[:500]
 
-            _SECURITY_NOTIFY_LAST[
-                deduplication_key
-            ] = current_time
+    panel_host = (
+        request.host
+        or 'unknown'
+    ).strip()[:255]
 
-            if len(
-                _SECURITY_NOTIFY_LAST
-            ) > 500:
-                expiry = (
-                    current_time
-                    - 3600
-                )
-
-                for key, value in list(
-                    _SECURITY_NOTIFY_LAST.items()
-                ):
-                    if float(
-                        value or 0
-                    ) < expiry:
-                        _SECURITY_NOTIFY_LAST.pop(
-                            key,
-                            None,
-                        )
+    scheme = (
+        'HTTPS'
+        if _is_https()
+        else 'HTTP'
+    )
 
     if event_type == 'login_success':
-        title = '● Panel login accepted'
-        status = 'Authenticated'
+        event_key = (
+            'login_success'
+        )
+
+        title = (
+            'Panel login accepted'
+        )
+
+        status = (
+            'Authenticated'
+        )
+
+        dedupe_seconds = 0
 
     elif event_type == 'twofa_failed':
-        title = (
-            '⊘ Two-factor verification rejected'
+        event_key = (
+            'login_fail'
         )
-        status = 'Access denied'
+
+        title = (
+            'Two-factor verification rejected'
+        )
+
+        status = (
+            'Access denied'
+        )
+
+        dedupe_seconds = 10
+
+    elif event_type == 'login_failed':
+        event_key = (
+            'login_fail'
+        )
+
+        title = (
+            'Panel login rejected'
+        )
+
+        status = (
+            'Access denied'
+        )
+
+        dedupe_seconds = 10
 
     else:
-        title = '⊘ Panel login rejected'
-        status = 'Access denied'
 
-    message_lines = [
-        f'<b>{title}</b>',
-        '',
+        current_app.logger.debug(
+            'Unknown security notification event: %s',
+            event_type,
+        )
+
+        return
+
+    # ---------------------
+    # Notification details
+    # ---------------------
+    details = [
         (
-            '◇ <b>Account</b>  '
-            f'<code>{_security_html_escape(username)}</code>'
+            'Account',
+            username,
         ),
         (
-            '⌁ <b>Client IP</b>  '
-            f'<code>{_security_html_escape(client_ip)}</code>'
+            'Client IP',
+            client_ip,
         ),
         (
-            '▦ <b>Device</b>  '
-            f'{_security_html_escape(device_summary)}'
+            'Device',
+            device_summary,
         ),
         (
-            '◷ <b>Time</b>  '
-            f'<code>{_security_html_escape(timestamp)}</code>'
-        ),
-        (
-            '◆ <b>Status</b>  '
-            f'{_security_html_escape(status)}'
-        ),
-        (
-            '⌂ <b>Panel</b>  '
-            f'<code>{_security_html_escape(panel_host)}</code>'
-            f' · {scheme}'
+            'Panel address',
+            (
+                f'{panel_host} · {scheme}'
+            ),
         ),
     ]
 
     if reason:
-        message_lines.append(
-            '✦ <b>Reason</b>  '
-            f'{_security_html_escape(reason)}'
+        details.append(
+            (
+                'Reason',
+                reason,
+            )
         )
 
     if (
         proxy_chain
         and proxy_chain != client_ip
     ):
-        message_lines.append(
-            '↪ <b>Proxy chain</b>  '
-            f'<code>{_security_html_escape(proxy_chain[:400])}</code>'
+        details.append(
+            (
+                'Proxy chain',
+                proxy_chain,
+            )
         )
 
-    message_lines.extend([
-        '',
-        (
-            '<code>'
-            f'{_security_html_escape(raw_user_agent)}'
-            '</code>'
+    if raw_user_agent:
+        details.append(
+            (
+                'User agent',
+                raw_user_agent,
+            )
+        )
+
+    _send_telegram_event(
+        event_key,
+        title,
+        status=status,
+        details=details,
+
+        dedupe_key=(
+            f'{event_type}:'
+            f'{client_ip}:'
+            f'{username}:'
+            f'{reason}'
         ),
-    ])
 
-    message = '\n'.join(
-        message_lines
+        dedupe_seconds=(
+            dedupe_seconds
+        ),
     )
-
-    flask_app = (
-        current_app
-        ._get_current_object()
-    )
-
-    def notification_worker():
-        with flask_app.app_context():
-            for chat_id in recipients:
-                try:
-                    response = requests.post(
-                        (
-                            'https://api.telegram.org/'
-                            f'bot{bot_token}/sendMessage'
-                        ),
-                        json={
-                            'chat_id': chat_id,
-                            'text': message,
-                            'parse_mode': 'HTML',
-                            'disable_web_page_preview': True,
-                        },
-                        timeout=8,
-                    )
-
-                    if not response.ok:
-                        flask_app.logger.warning(
-                            'Telegram security notification '
-                            'failed: chat_id=%s status=%s '
-                            'response=%s',
-                            chat_id,
-                            response.status_code,
-                            response.text[:300],
-                        )
-
-                except Exception:
-                    flask_app.logger.debug(
-                        'Telegram security notification '
-                        'failed for chat_id=%s',
-                        chat_id,
-                        exc_info=True,
-                    )
-
-    threading.Thread(
-        target=notification_worker,
-        name='telegram-security-alert',
-        daemon=True,
-    ).start()
 
 @app.route('/api/telegram/test', methods=['POST'])
 @login_required
@@ -6095,254 +8438,152 @@ def _send_zip_telegram(
     data_bytes: bytes,
     filename: str,
     chat_id: str | None = None,
+    caption: str | None = None,
 ) -> tuple[bool, str]:
     settings = _load_tg_settings()
 
-    if not settings.get('enabled'):
-        return False, 'Telegram disabled.'
+    if not settings.get("enabled"):
+        return False, "Telegram disabled."
 
     token = (
-        settings.get('bot_token')
-        or ''
+        settings.get("bot_token")
+        or ""
     ).strip()
 
     if not token:
-        return False, 'Telegram token missing.'
+        return False, "Telegram token missing."
 
     selected_chat_id = str(
         chat_id
         or _tg_chatid()
-        or ''
+        or ""
     ).strip()
 
     if not selected_chat_id:
         return False, (
-            'No active Telegram administrator selected.'
+            "No active Telegram administrator selected."
         )
 
     active_admin_ids = {
         str(
-            admin.get('id')
-            or ''
+            admin.get("id")
+            or ""
         ).strip()
         for admin in (
             _load_tg_admins()
             or []
         )
         if (
-            not admin.get('muted')
+            not admin.get("muted")
             and str(
-                admin.get('id')
-                or ''
+                admin.get("id")
+                or ""
             ).strip()
         )
     }
 
     if selected_chat_id not in active_admin_ids:
         return False, (
-            'Selected Telegram recipient is not an '
-            'active panel administrator.'
+            "Selected Telegram recipient is not an "
+            "active panel administrator."
         )
-
 
     size_bytes = len(
         data_bytes
-        or b''
+        or b""
     )
 
-    size_value = float(
-        size_bytes
-    )
+    if not caption:
+        try:
+            size_text = _tg_human_bytes(
+                size_bytes
+            )
+        except Exception:
+            size_text = (
+                f"{size_bytes} bytes"
+            )
 
-    size_unit = 'B'
+        created_at = _tg_now_text()
 
-    for unit in (
-        'B',
-        'KiB',
-        'MiB',
-        'GiB',
-        'TiB',
-    ):
-        size_unit = unit
+        caption = "\n".join([
+            "<b>WG Panel backup</b>",
+            "",
+            "<b>Status</b> · Completed",
+            (
+                "<b>File</b> · "
+                f"<code>{_tg_event_escape(filename)}</code>"
+            ),
+            (
+                "<b>Size</b> · "
+                f"{_tg_event_escape(size_text)}"
+            ),
+            (
+                "<b>Created</b> · "
+                f"{_tg_event_escape(created_at)}"
+            ),
+        ])
 
-        if (
-            size_value < 1024
-            or unit == 'TiB'
-        ):
-            break
-
-        size_value /= 1024.0
-
-    if size_unit == 'B':
-        size_text = (
-            f'{int(size_value)} B'
-        )
-    else:
-        size_text = (
-            f'{size_value:.1f} '
-            f'{size_unit}'
-        )
-
-
-    created_at = datetime.now(
-        timezone.utc
-    ).strftime(
-        '%Y-%m-%d %H:%M:%S UTC'
-    )
-
-    safe_filename = (
-        _tg_event_escape(
-            filename
-        )
-    )
-
-    safe_size = (
-        _tg_event_escape(
-            size_text
-        )
-    )
-
-    safe_created_at = (
-        _tg_event_escape(
-            created_at
-        )
-    )
-
-    safe_panel_host = (
-        _tg_event_escape(
-            socket.gethostname()
-        )
-    )
-
-    caption = '\n'.join([
-        '▣ <b>WG Panel automatic backup</b>',
-        '<i>Scheduled protected archive</i>',
-        '',
-        '● <b>Status</b>  Completed',
-        (
-            '◇ <b>File</b>  '
-            f'<code>{safe_filename}</code>'
-        ),
-        (
-            '◇ <b>Size</b>  '
-            f'<code>{safe_size}</code>'
-        ),
-        (
-            '◇ <b>Created</b>  '
-            f'<code>{safe_created_at}</code>'
-        ),
-        (
-            '◇ <b>Stored locally</b>  '
-            'Yes'
-        ),
-        (
-            '⌂ <b>Panel host</b>  '
-            f'<code>{safe_panel_host}</code>'
-        ),
-        '',
-        (
-            '⌁ <i>Keep this archive private. '
-            'It may contain WireGuard keys, '
-            'Telegram credentials, panel settings, '
-            'and node configuration.</i>'
-        ),
-    ])
+    if len(caption) > 1000:
+        caption = caption[:997] + "..."
 
     try:
         response = requests.post(
             (
-                'https://api.telegram.org/'
-                f'bot{token}/sendDocument'
+                "https://api.telegram.org/bot"
+                f"{token}/sendDocument"
             ),
             data={
-                'chat_id': (
-                    selected_chat_id
-                ),
-                'disable_notification': (
-                    True
-                ),
-                'parse_mode': 'HTML',
-                'caption': caption,
+                "chat_id": selected_chat_id,
+                "disable_notification": "true",
+                "caption": caption,
+                "parse_mode": "HTML",
             },
             files={
-                'document': (
+                "document": (
                     filename,
                     data_bytes,
-                    'application/zip',
+                    "application/zip",
                 )
             },
-            timeout=(
-                10,
-                120,
-            ),
+            timeout=60,
         )
 
         try:
-            result = response.json()
+            payload = (
+                response.json()
+                or {}
+            )
         except Exception:
-            result = {}
+            payload = {}
 
         if (
             response.ok
-            and isinstance(
-                result,
-                dict,
-            )
-            and result.get('ok')
+            and payload.get("ok")
         ):
-            return True, (
-                'Backup sent to Telegram '
-                f'administrator {selected_chat_id}.'
+            return (
+                True,
+                "Backup document sent to Telegram.",
             )
 
-        description = (
-            result.get('description')
-            if isinstance(
-                result,
-                dict,
-            )
-            else ''
-        )
+        description = str(
+            payload.get("description")
+            or response.text
+            or ""
+        )[:300]
 
-        detail = (
-            description
-            or str(result)[:300]
-            or response.text[:300]
-        )
-
-        return False, (
-            'Telegram error: '
-            f'{response.status_code} '
-            f'{detail}'
-        )
-
-    except requests.exceptions.ReadTimeout:
-        return False, (
-            'Telegram response timed out after upload. '
-            'The backup may still have been delivered.'
-        )
-
-    except requests.exceptions.ConnectTimeout:
-        return False, (
-            'Could not connect to Telegram '
-            'within the timeout.'
-        )
-
-    except requests.exceptions.RequestException as exc:
-        return False, (
-            'Telegram request error: '
-            f'{exc}'
+        return (
+            False,
+            (
+                "Telegram error "
+                f"{response.status_code}: "
+                f"{description}"
+            ),
         )
 
     except Exception as exc:
-        current_app.logger.exception(
-            'Unexpected Telegram backup error: %s',
-            exc,
-        )
-
-        return False, (
-            'Telegram exception: '
-            f'{exc}'
+        return (
+            False,
+            f"Telegram exception: {exc}",
         )
 
 @app.get('/api/backup/db')
@@ -7068,36 +9309,141 @@ def backup_full():
     return resp
 
 def _load_backup_schedule():
-    d = _json_load(BACKUP_SCHEDULE_FILE, {})
+    d = _json_load(
+        BACKUP_SCHEDULE_FILE,
+        {},
+    )
+
     return {
-        "enabled": bool(d.get("enabled", False)),
-        "freq": d.get("freq", "daily"),
-        "time": d.get("time", "03:00"),
-        "timezone": (d.get("timezone") or "UTC"),
-        "dow":  list(map(str, d.get("dow", []))),
-        "dom":  int(d.get("dom", 1)),
-        "cron": d.get("cron", ""),
-        "keep": int(d.get("keep", 7)),
-        "include_wg": bool(d.get("include_wg", True)),
-        "send_to_telegram": bool(d.get("send_to_telegram", False)),
+        "enabled": bool(
+            d.get("enabled", False)
+        ),
+        "freq": d.get(
+            "freq",
+            "daily",
+        ),
+        "time": d.get(
+            "time",
+            "03:00",
+        ),
+
+        "timezone": _panel_timezone_name(),
+
+        "dow": list(
+            map(
+                str,
+                d.get("dow", []),
+            )
+        ),
+        "dom": int(
+            d.get("dom", 1)
+        ),
+        "cron": d.get(
+            "cron",
+            "",
+        ),
+        "keep": int(
+            d.get("keep", 7)
+        ),
+        "include_wg": bool(
+            d.get("include_wg", True)
+        ),
+        "send_to_telegram": bool(
+            d.get(
+                "send_to_telegram",
+                False,
+            )
+        ),
+
+        "telegram_chat_id": str(
+            d.get(
+                "telegram_chat_id",
+                "",
+            )
+            or ""
+        ).strip(),
     }
 
 
 def _save_backup_schedule(partial: dict):
     cur = _load_backup_schedule()
+
     cur.update({
-        "enabled": bool(partial.get("enabled", cur["enabled"])),
-        "freq": (partial.get("freq") or cur["freq"]).lower(),
-        "time": partial.get("time") or cur["time"],
-        "timezone": (partial.get("timezone") or cur.get("timezone") or "UTC"),
-        "dow":  [str(x) for x in (partial.get("dow") or cur["dow"] or [])],
-        "dom":  int(partial.get("dom") or cur["dom"] or 1),
-        "cron": (partial.get("cron") or cur["cron"]).strip(),
-        "keep": max(1, int(partial.get("keep") or cur["keep"] or 7)),
-        "include_wg": bool(partial.get("include_wg", cur["include_wg"])),
-        "send_to_telegram": bool(partial.get("send_to_telegram", cur["send_to_telegram"])),
+        "enabled": bool(
+            partial.get(
+                "enabled",
+                cur["enabled"],
+            )
+        ),
+        "freq": (
+            partial.get("freq")
+            or cur["freq"]
+        ).lower(),
+        "time": (
+            partial.get("time")
+            or cur["time"]
+        ),
+
+        "timezone": _panel_timezone_name(),
+
+        "dow": [
+            str(x)
+            for x in (
+                partial.get("dow")
+                or cur["dow"]
+                or []
+            )
+        ],
+        "dom": int(
+            partial.get("dom")
+            or cur["dom"]
+            or 1
+        ),
+        "cron": (
+            partial.get("cron")
+            or cur["cron"]
+        ).strip(),
+        "keep": max(
+            1,
+            int(
+                partial.get("keep")
+                or cur["keep"]
+                or 7
+            ),
+        ),
+        "include_wg": bool(
+            partial.get(
+                "include_wg",
+                cur["include_wg"],
+            )
+        ),
+        "send_to_telegram": bool(
+            partial.get(
+                "send_to_telegram",
+                cur["send_to_telegram"],
+            )
+        ),
+
+        "telegram_chat_id": str(
+            partial.get(
+                "telegram_chat_id",
+                cur.get(
+                    "telegram_chat_id",
+                    "",
+                ),
+            )
+            or ""
+        ).strip(),
     })
-    _json_save(BACKUP_SCHEDULE_FILE, cur)
+
+    if not cur["send_to_telegram"]:
+        cur["telegram_chat_id"] = ""
+
+    _json_save(
+        BACKUP_SCHEDULE_FILE,
+        cur,
+    )
+
     return cur
 
 def _load_backup_last():
@@ -7203,9 +9549,6 @@ def backup_schedule_post():
     s["next_run"] = _next_run(s)
     return jsonify(ok=True, **s)
 
-# ------------------------------------------------------------------
-# Real auto-backup scheduler
-# ------------------------------------------------------------------
 
 _BACKUP_SCHEDULER_STARTED = False
 _BACKUP_SCHEDULER_INTERVAL_SEC = 30
@@ -7466,10 +9809,23 @@ def _run_scheduled_backup(
     sched: dict,
     slot: str,
 ) -> dict:
-    """
-    Create the same complete ZIP used by Run once.
-    """
+
     from urllib.parse import urlencode
+
+    send_to_telegram = bool(
+        sched.get(
+            "send_to_telegram",
+            False,
+        )
+    )
+
+    telegram_chat_id = str(
+        sched.get(
+            "telegram_chat_id",
+            "",
+        )
+        or ""
+    ).strip()
 
     query = {
         "auto": "1",
@@ -7481,22 +9837,13 @@ def _run_scheduled_backup(
             )
             else "0"
         ),
-        "tg": (
-            "1"
-            if sched.get(
-                "send_to_telegram",
-                False,
-            )
-            else "0"
-        ),
+        "tg": "0",
     }
 
     request_path = (
         "/api/backup/full?"
         + urlencode(query)
     )
-
-    backup_metadata = {}
 
     with app.test_request_context(
         request_path
@@ -7513,10 +9860,7 @@ def _run_scheduled_backup(
 
         response = backup_function()
 
-        if isinstance(
-            response,
-            tuple,
-        ):
+        if isinstance(response, tuple):
             flask_response = response[0]
             tuple_status = (
                 response[1]
@@ -7576,19 +9920,154 @@ def _run_scheduled_backup(
         except Exception:
             saved_timestamp = 0
 
-        if not saved_name:
+    if not saved_name:
+        raise RuntimeError(
+            "The backup response did not confirm "
+            "a locally saved automatic archive."
+        )
+
+    backup_root = Path(
+        BACKUP_AUTO_DIR
+    ).resolve()
+
+    backup_path = (
+        backup_root
+        / os.path.basename(saved_name)
+    ).resolve()
+
+    try:
+        backup_path.relative_to(
+            backup_root
+        )
+    except ValueError:
+        raise RuntimeError(
+            "Automatic backup path validation failed."
+        )
+
+    if not backup_path.is_file():
+        raise RuntimeError(
+            "Automatic backup was created but the stored "
+            f"ZIP could not be found: {saved_name}"
+        )
+
+    try:
+        data_bytes = backup_path.read_bytes()
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not read the stored automatic backup: "
+            f"{exc}"
+        ) from exc
+
+    if not data_bytes:
+        raise RuntimeError(
+            "The stored automatic backup is empty."
+        )
+
+    if not data_bytes.startswith(b"PK"):
+        raise RuntimeError(
+            "The stored automatic backup is not a valid ZIP."
+        )
+
+    saved_size = len(data_bytes)
+
+    completed_at = (
+        datetime.utcnow()
+        .isoformat(
+            timespec="seconds"
+        )
+        + "Z"
+    )
+
+    telegram_sent = False
+    telegram_message = ""
+
+    if send_to_telegram:
+        if not telegram_chat_id:
             raise RuntimeError(
-                "The backup response did not confirm "
-                "a locally saved automatic archive."
+                "Telegram delivery is enabled, but no "
+                "Telegram administrator is selected."
             )
 
-        backup_metadata = {
-            "filename": saved_name,
-            "name": saved_name,
-            "size": saved_size,
-            "size_bytes": saved_size,
-            "timestamp": saved_timestamp,
-        }
+        scheduled_dt = _backup_slot_datetime(
+            slot,
+            sched,
+        )
+
+        schedule_text = _tg_human_datetime(
+            scheduled_dt,
+            seconds=False,
+        )
+
+        completed_text = _tg_human_datetime(
+            completed_at,
+            seconds=False,
+        )
+
+        try:
+            size_text = _tg_human_bytes(
+                saved_size
+            )
+        except Exception:
+            size_text = (
+                f"{saved_size} bytes"
+            )
+
+        caption = "\n".join([
+            "<b>Automatic backup completed</b>",
+            "",
+            "<b>Status</b> · Completed",
+            (
+                "<b>Schedule time</b> · "
+                f"{_tg_event_escape(schedule_text)}"
+            ),
+            (
+                "<b>Completed at</b> · "
+                f"{_tg_event_escape(completed_text)}"
+            ),
+            (
+                "<b>File</b> · "
+                f"<code>{_tg_event_escape(saved_name)}</code>"
+            ),
+            (
+                "<b>Size</b> · "
+                f"{_tg_event_escape(size_text)}"
+            ),
+        ])
+
+        telegram_sent, telegram_message = (
+            _send_zip_telegram(
+                data_bytes,
+                saved_name,
+                chat_id=telegram_chat_id,
+                caption=caption,
+            )
+        )
+
+        if not telegram_sent:
+            raise RuntimeError(
+                "Backup was stored locally, but Telegram "
+                "document delivery failed: "
+                f"{telegram_message}"
+            )
+
+        app.logger.info(
+            "Automatic backup delivered to Telegram: "
+            "file=%s chat_id=%s size=%s",
+            saved_name,
+            telegram_chat_id,
+            saved_size,
+        )
+
+    backup_metadata = {
+        "filename": saved_name,
+        "name": saved_name,
+        "size": saved_size,
+        "size_bytes": saved_size,
+        "timestamp": saved_timestamp,
+        "telegram_requested": send_to_telegram,
+        "telegram_sent": telegram_sent,
+        "telegram_message": telegram_message,
+    }
 
     state = _json_load(
         _BACKUP_SCHEDULER_STATE_FILE,
@@ -7601,32 +10080,24 @@ def _run_scheduled_backup(
     ):
         state = {}
 
-    completed_at = (
-        datetime.utcnow()
-        .isoformat(
-            timespec="seconds"
-        )
-        + "Z"
-    )
-
     state.update({
         "last_slot": slot,
         "last_success": completed_at,
         "last_success_at": completed_at,
-        "last_file": (
-            backup_metadata.get(
-                "filename"
-            )
-            or ""
-        ),
-        "last_size": int(
-            backup_metadata.get(
-                "size"
-            )
-            or 0
-        ),
+        "last_file": saved_name,
+        "last_size": saved_size,
         "last_error": "",
         "last_error_at": "",
+        "last_telegram_sent": (
+            telegram_sent
+            if send_to_telegram
+            else None
+        ),
+        "last_telegram_message": (
+            telegram_message
+            if send_to_telegram
+            else ""
+        ),
     })
 
     _json_save(
@@ -7636,17 +10107,55 @@ def _run_scheduled_backup(
 
     return backup_metadata
 
-def _backup_scheduler_loop():
+def _backup_slot_datetime(
+    slot: str,
+    schedule: dict,
+):
     """
-    Run the automatic backup scheduler in only one Gunicorn worker.
+    Convert a scheduler slot such as:
 
+        daily:2026-08-25T06:30
+
+    into a timezone-aware datetime.
+
+    Scheduler slot clock values are in panel timezone.
     """
+    raw = str(
+        slot or ""
+    ).strip()
+
+    if ":" not in raw:
+        return None
+
+    _frequency, timestamp_text = (
+        raw.split(
+            ":",
+            1,
+        )
+    )
+
+    try:
+        parsed = datetime.fromisoformat(
+            timestamp_text
+        )
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=_panel_timezone()
+        )
+
+    return parsed
+
+def _backup_scheduler_loop():
+
     lock_handle = None
 
     try:
         lock_handle = open(
             _BACKUP_SCHEDULER_LOCK_FILE,
-            'a+',
+            "a+",
         )
 
         fcntl.flock(
@@ -7667,9 +10176,7 @@ def _backup_scheduler_loop():
     while True:
         try:
             with app.app_context():
-                schedule = (
-                    _load_backup_schedule()
-                )
+                schedule = _load_backup_schedule()
 
                 slot = _backup_due_slot(
                     schedule
@@ -7688,11 +10195,11 @@ def _backup_scheduler_loop():
 
                 if (
                     slot
-                    and state.get(
-                        'last_slot'
-                    ) != slot
+                    and state.get("last_slot")
+                    != slot
                 ):
                     try:
+
                         backup_result = (
                             _run_scheduled_backup(
                                 schedule,
@@ -7703,38 +10210,28 @@ def _backup_scheduler_loop():
                         completed_at = (
                             datetime.utcnow()
                             .isoformat(
-                                timespec='seconds'
+                                timespec="seconds"
                             )
-                            + 'Z'
-                        )
-
-                        state.update({
-                            'last_slot': slot,
-                            'last_success_at': (
-                                completed_at
-                            ),
-                            'last_error': '',
-                            'last_error_at': '',
-                        })
-
-                        _json_save(
-                            _BACKUP_SCHEDULER_STATE_FILE,
-                            state,
+                            + "Z"
                         )
 
                         app.logger.info(
-                            'Automatic backup completed: '
-                            'slot=%s',
+                            "Automatic backup completed: "
+                            "slot=%s",
                             slot,
                         )
 
                         notification_details = [
                             (
-                                'Schedule slot',
-                                slot,
+                                "Schedule time",
+                                _backup_slot_datetime(
+                                    slot,
+                                    schedule,
+                                )
+                                or slot,
                             ),
                             (
-                                'Completed at',
+                                "Completed at",
                                 completed_at,
                             ),
                         ]
@@ -7743,118 +10240,153 @@ def _backup_scheduler_loop():
                             backup_result,
                             dict,
                         ):
-                            backup_filename = (
+                            backup_filename = str(
                                 backup_result.get(
-                                    'filename'
+                                    "filename"
                                 )
                                 or backup_result.get(
-                                    'file'
+                                    "file"
                                 )
                                 or backup_result.get(
-                                    'name'
+                                    "name"
                                 )
-                                or ''
-                            )
+                                or ""
+                            ).strip()
 
                             backup_size = (
                                 backup_result.get(
-                                    'size'
+                                    "size"
                                 )
                                 or backup_result.get(
-                                    'size_bytes'
+                                    "size_bytes"
                                 )
-                                or ''
                             )
 
                             if backup_filename:
                                 notification_details.append(
                                     (
-                                        'File',
+                                        "File",
                                         backup_filename,
                                     )
                                 )
 
                             if backup_size not in (
                                 None,
-                                '',
+                                "",
                             ):
                                 notification_details.append(
                                     (
-                                        'Size bytes',
+                                        "Size bytes",
                                         backup_size,
                                     )
                                 )
 
-                        _send_telegram_event(
-                            'backup_success',
-                            (
-                                '● Automatic backup '
-                                'completed'
-                            ),
-                            status='Completed',
-                            details=notification_details,
-                            dedupe_key=(
-                                f'backup-success:{slot}'
-                            ),
-                            dedupe_seconds=0,
-                        )
+                        if not schedule.get(
+                            "send_to_telegram",
+                            False,
+                        ):
+                            _send_telegram_event(
+                                "backup_success",
+                                (
+                                    "● Automatic backup "
+                                    "completed"
+                                ),
+                                status="Completed",
+                                details=(
+                                    notification_details
+                                ),
+                                dedupe_key=(
+                                    f"backup-success:{slot}"
+                                ),
+                                dedupe_seconds=0,
+                            )
+
+                        # _run_scheduled_backup() 
+                        #
+                        # - last_slot
+                        # - last_success
+                        # - last_success_at
+                        # - last_file
+                        # - last_size
+                        # - last_error
+                        # - last_error_at
+                        # - last_telegram_sent
+                        # - last_telegram_message
 
                     except Exception as exc:
                         failed_at = (
                             datetime.utcnow()
                             .isoformat(
-                                timespec='seconds'
+                                timespec="seconds"
                             )
-                            + 'Z'
+                            + "Z"
                         )
 
-                        state.update({
-                            'last_slot': slot,
-                            'last_error': str(
+                        failure_state = _json_load(
+                            _BACKUP_SCHEDULER_STATE_FILE,
+                            {},
+                        )
+
+                        if not isinstance(
+                            failure_state,
+                            dict,
+                        ):
+                            failure_state = {}
+
+                        failure_state.update({
+
+                            "last_slot": slot,
+
+                            "last_error": str(
                                 exc
                             ),
-                            'last_error_at': (
+
+                            "last_error_at": (
                                 failed_at
                             ),
                         })
 
                         _json_save(
                             _BACKUP_SCHEDULER_STATE_FILE,
-                            state,
+                            failure_state,
                         )
 
                         app.logger.exception(
-                            'Automatic backup failed: '
-                            'slot=%s error=%s',
+                            "Automatic backup failed: "
+                            "slot=%s error=%s",
                             slot,
                             exc,
                         )
 
                         _send_telegram_event(
-                            'backup_failed',
+                            "backup_failed",
                             (
-                                '● Automatic backup '
-                                'failed'
+                                "● Automatic backup "
+                                "failed"
                             ),
-                            status='Failed',
+                            status="Failed",
                             details=[
                                 (
-                                    'Schedule slot',
-                                    slot,
+                                    "Schedule time",
+                                    _backup_slot_datetime(
+                                        slot,
+                                        schedule,
+                                    )
+                                    or slot,
                                 ),
                                 (
-                                    'Failed at',
+                                    "Failed at",
                                     failed_at,
                                 ),
                                 (
-                                    'Error',
+                                    "Error",
                                     str(
                                         exc
                                     )[:300],
                                 ),
                             ],
                             dedupe_key=(
-                                f'backup-failed:{slot}'
+                                f"backup-failed:{slot}"
                             ),
                             dedupe_seconds=300,
                         )
@@ -7862,7 +10394,7 @@ def _backup_scheduler_loop():
         except Exception as exc:
             try:
                 app.logger.exception(
-                    'Backup scheduler sweep failed: %s',
+                    "Backup scheduler sweep failed: %s",
                     exc,
                 )
             except Exception:
@@ -8471,56 +11003,176 @@ def _wg_handshake(peer):
         return 0
 
 def _wireguard_endpoint(value: str) -> str:
+    """
+    Accepted:
+        1.2.3.4:51820
+        example.com:51820
+        [2001:db8::1]:51820
+        DNS resolution belongs to the runtime
+    """
 
-    raw = (value or "").strip()
+    raw = str(value or '').strip()
 
     if not raw:
-        return ""
+        return ''
 
     try:
         host, port = _host_port(raw)
 
+        host = str(host or '').strip()
+        port = str(port or '').strip()
+
         if not host or not port:
             raise ValueError(
-                "Fixed client endpoint must use host:port format."
-            )
-
-        port = int(port)
-
-        if not 1 <= port <= 65535:
-            raise ValueError(
-                "Fixed client endpoint port must be between 1 and 65535."
+                'Fixed client endpoint must use host:port format.'
             )
 
         try:
-            address = ipaddress.ip_address(host).compressed
-            return _norm_hostport(address, port)
+            port = int(port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'Fixed client endpoint port must be a number.'
+            ) from exc
+
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                'Fixed client endpoint port must be between 1 and 65535.'
+            )
+
+
+        try:
+            address = ipaddress.ip_address(
+                host.strip('[]')
+            )
+
+            return _norm_hostport(
+                address.compressed,
+                port,
+            )
+
         except ValueError:
             pass
 
+        hostname = host.rstrip('.')
+
+        if (
+            not hostname
+            or len(hostname) > 253
+        ):
+            raise ValueError(
+                'Fixed client endpoint hostname is invalid.'
+            )
+
+        labels = hostname.split('.')
+
+        for label in labels:
+            if (
+                not label
+                or len(label) > 63
+                or not re.fullmatch(
+                    r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?',
+                    label,
+                )
+            ):
+                raise ValueError(
+                    'Fixed client endpoint hostname is invalid.'
+                )
+
+        # Preserve hostname instead of converting it to an IP.
+        return _norm_hostport(
+            hostname,
+            port,
+        )
+
+    except Exception as exc:
+        raise RuntimeError(
+            f'Invalid fixed client endpoint: {raw}. {exc}'
+        ) from exc
+
+def _wireguard_runtime_endpoint(value: str) -> str:
+    """
+    Resolve a fixed WG endpoint
+
+    Persistent/database value remains the original hostname.
+
+    Example:
+        stored:
+            vpn.example.com:51820
+
+        runtime:
+            203.0.113.20:51820
+    """
+
+    endpoint = _wireguard_endpoint(
+        value
+    )
+
+    if not endpoint:
+        return ''
+
+    host, port = _host_port(
+        endpoint
+    )
+
+    host = str(
+        host or ''
+    ).strip().strip('[]')
+
+    port = int(port)
+
+    # Already an IP address.
+    try:
+        address = ipaddress.ip_address(
+            host
+        )
+
+        return _norm_hostport(
+            address.compressed,
+            port,
+        )
+
+    except ValueError:
+        pass
+
+    try:
         results = socket.getaddrinfo(
             host,
             port,
             type=socket.SOCK_DGRAM,
         )
 
-        if not results:
-            raise ValueError(
-                f"Could not resolve fixed client endpoint domain: {host}"
+    except socket.gaierror as exc:
+        raise RuntimeError(
+            (
+                'Fixed client endpoint DNS lookup failed: '
+                f'{host}. {exc}'
             )
+        ) from exc
 
-        resolved_ip = results[0][4][0]
-
-        return _norm_hostport(
-            resolved_ip,
-            port,
+    if not results:
+        raise RuntimeError(
+            f'Fixed client endpoint DNS lookup returned no addresses: {host}'
         )
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"Fixed client endpoint could not be resolved: {raw}. {exc}"
-        ) from exc
-    
+    ipv4 = next(
+        (
+            result[4][0]
+            for result in results
+            if result[0] == socket.AF_INET
+        ),
+        None,
+    )
+
+    resolved = (
+        ipv4
+        or results[0][4][0]
+    )
+
+    return _norm_hostport(
+        resolved,
+        port,
+    )
+
 def _wg_enable(peer):
 
     dev = iface_devname(peer.iface)
@@ -8548,7 +11200,12 @@ def _wg_enable(peer):
     fixed_endpoint = (getattr(peer, "peer_endpoint", None)or "").strip()
 
     if fixed_endpoint:
-        cmd += ["endpoint",_wireguard_endpoint(fixed_endpoint),]
+        cmd += [
+        'endpoint',
+        _wireguard_runtime_endpoint(
+            fixed_endpoint
+        ),
+    ]
 
     if peer.persistent_keepalive:
         cmd += [
@@ -9148,6 +11805,26 @@ def api_settings():
 
     force_https = bool(data.get("force_https_redirect", False))
     hsts        = bool(data.get("hsts", False))
+    requested_timezone = (
+        data.get("timezone")
+        if "timezone" in data
+        else cur.get("timezone")
+        )
+
+    panel_timezone = _valid_timezone_name(
+        requested_timezone
+    )
+
+    if not panel_timezone:
+        return jsonify(
+            ok=False,
+            error="invalid_timezone",
+            message=(
+            "Timezone must be a valid "
+            "IANA timezone such as "
+            "Asia/Tehran or Europe/Amsterdam."
+            ),
+        ), 400
 
     if not tls_enabled:
         force_https = False
@@ -9174,6 +11851,7 @@ def api_settings():
         "https_port": https_port,
         "tls_cert_path": tls_cert_path,
         "tls_key_path": tls_key_path,
+        "timezone": panel_timezone,
     }
 
     _save_panel_settings(payload)
@@ -9197,6 +11875,36 @@ def api_settings():
 
     return jsonify(ok=True, settings=payload, next_url=next_url, requires_restart=True)
 
+@app.get("/api/timezone")
+@require_api_key_or_login
+def api_timezone():
+    tz_name = _panel_timezone_name()
+    tz = _panel_timezone()
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    now_local = now_utc.astimezone(
+        tz
+    )
+
+    return jsonify(
+        ok=True,
+        timezone=tz_name,
+        utc_now=now_utc.isoformat(
+            timespec="seconds"
+        ).replace(
+            "+00:00",
+            "Z",
+        ),
+        local_now=now_local.isoformat(
+            timespec="seconds"
+        ),
+        utc_offset=now_local.strftime(
+            "%z"
+        ),
+    )
 
 @app.get('/api/template_settings')
 @login_required
@@ -9760,19 +12468,9 @@ def _read_iface_conf(conf_path: str | None) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Address allocation contract
-# ---------------------------------------------------------------------------
-# One allocator, used by every path that can create a peer: the /users form,
-# /api/peers, /api/peers/bulk, subscription inbound creation and node create.
-#
-# Vocabulary (see wg-quick(8)): `Address` belongs to the INTERFACE, a peer's
-# `AllowedIPs` selects traffic for that peer. The interface host address is
-# therefore never a client address, and no placeholder peer is required at
-# interface creation.
-# ---------------------------------------------------------------------------
-
-# Upper bound on host enumeration so a /64 cannot hang a request.
+# ---------------------------
+# Address allocation
+# ---------------------------
 MAX_ENUMERATED_HOSTS = 8192
 
 
@@ -9784,21 +12482,18 @@ class AddressAllocationError(Exception):
 
 
 class AddressInvalid(AddressAllocationError):
-    """The requested address can never be used on this interface."""
 
     http_status = 400
     error_code = 'invalid_address'
 
 
 class AddressConflict(AddressAllocationError):
-    """The requested address is well formed but already reserved."""
 
     http_status = 409
     error_code = 'address_conflict'
 
 
 class AddressPoolExhausted(AddressConflict):
-    """The interface network has no free client address left."""
 
     error_code = 'address_pool_exhausted'
 
@@ -9809,11 +12504,7 @@ def _iface_is_node(iface) -> bool:
 
 
 def interface_ip_interface(iface):
-    """Return the interface's own ``ip_interface`` (host address + network).
 
-    For local interfaces the on-disk ``Address=`` wins over the database copy,
-    because the file is what ``wg-quick`` actually applies.
-    """
     if not iface:
         return None
 
@@ -9843,11 +12534,7 @@ def interface_ip_interface(iface):
 
 
 def _usable_hosts(net):
-    """Yield client-usable hosts of ``net``, bounded to keep requests cheap.
 
-    ``network.hosts()`` already handles the /31 and /32 (and /127, /128) edge
-    cases documented in the ``ipaddress`` module.
-    """
     for index, host in enumerate(net.hosts()):
         if index >= MAX_ENUMERATED_HOSTS:
             return
@@ -9855,11 +12542,7 @@ def _usable_hosts(net):
 
 
 def _db_peer_hosts(iface, exclude_peer_id=None):
-    """Canonical hosts recorded in the database for this interface.
 
-    Queried directly rather than through ``iface.peers`` so that peers added
-    earlier in the same transaction (autoflushed) are taken into account.
-    """
     hosts = set()
     iface_id = getattr(iface, 'id', None)
     if not iface_id:
@@ -9877,11 +12560,7 @@ def _db_peer_hosts(iface, exclude_peer_id=None):
 
 
 def _reserved_hosts(iface, ip_iface, *, exclude_peer_id=None, exclude_address=None, extra=()):
-    """Every host address that must not be handed to a new peer.
 
-    ``exclude_address`` releases a peer's own current host so that re-saving it
-    unchanged is not reported as a conflict with itself.
-    """
     net = ip_iface.network
     reserved = {ip_iface.ip}
 
@@ -9910,7 +12589,6 @@ def _reserved_hosts(iface, ip_iface, *, exclude_peer_id=None, exclude_address=No
 
 
 def _validate_requested_host(ip_iface, requested):
-    """Parse an explicitly requested client address, or return ``None``."""
     text = str(requested or '').strip()
     if not text:
         return None
@@ -9943,12 +12621,7 @@ def _validate_requested_host(ip_iface, requested):
 
 def allocate_peer_address(iface, requested=None, *, exclude_peer_id=None,
                           exclude_address=None, extra_reserved=()):
-    """Return the client address (``host/prefix``) to give a peer.
 
-    ``AddressInvalid`` (400) means the input can never work on this interface;
-    ``AddressConflict`` / ``AddressPoolExhausted`` (409) mean it is well formed
-    but unavailable. Nothing is mutated - callers install the peer themselves.
-    """
     ip_iface = interface_ip_interface(iface)
     if ip_iface is None:
         raise AddressInvalid(
@@ -9979,16 +12652,11 @@ def allocate_peer_address(iface, requested=None, *, exclude_peer_id=None,
 
 
 def address_error_response(exc: AddressAllocationError):
-    """Turn an allocation failure into the documented 400/409 JSON response."""
     return jsonify(error=exc.error_code, detail=str(exc)), exc.http_status
 
 
 def client_address_on(iface, value):
-    """Re-express a host address with the interface's own prefix length.
 
-    A node reports a peer as ``10.77.77.2/32`` (its ``AllowedIPs``), but the
-    client's ``Address=`` must carry the interface prefix.
-    """
     host = _safe_ip(value)
     if host is None:
         return None
@@ -10001,12 +12669,7 @@ def client_address_on(iface, value):
 
 
 class NodePeerInstallError(Exception):
-    """The node refused or failed to install the peer.
 
-    ``code`` is the stable API error code surfaced in the JSON response; it is
-    used instead of ``str(exc)`` so a future message change cannot turn a
-    machine-readable code into prose (see finding #15).
-    """
 
     def __init__(self, code, status=502, detail='', message=None):
         super().__init__(message or code)
@@ -10018,30 +12681,7 @@ class NodePeerInstallError(Exception):
 def node_install_peer(node, iface_name, mirror, *, public_key, requested_address=None,
                       peer_endpoint='', keepalive=0, mtu=None, dns=None,
                       allowed_ips='0.0.0.0/0, ::/0', attempts=3):
-    """Install a peer on a node and return the address the node assigned.
 
-    The node agent allocates under its own per-interface lock, which is the
-    only place that can see that node's live runtime and config, so we let it
-    choose unless the caller supplied an address. A validated explicit address
-    is still honoured for backward compatibility, and a host conflict is
-    retried a bounded number of times against fresh data.
-
-    Two distinct 409s come back from the agent and must not be conflated:
-
-    * ``address_pool_exhausted`` -- the network has no free host. Not retryable;
-      mapped to the documented ``409 address_pool_exhausted`` so the client
-      does not see a misleading ``node_create_failed``.
-    * ``host_cidr_already_used`` -- someone took this exact host between our
-      pick and the install. Retryable when the caller did not pin an address.
-
-    When the caller *did* pin an address, a 409 collision is surfaced as-is
-    rather than papered over with a different address: returning a different
-    address with HTTP 200 would violate the "supply ``address`` to pin one"
-    contract documented in api_docs.html (finding #8).
-
-    ``peer_endpoint`` is a fixed remote-client endpoint. The node's own public
-    endpoint must never be sent here: that is client-facing data.
-    """
     host_cidr = None
     if requested_address:
         # Raises AddressInvalid / AddressConflict, which the caller maps to 400/409.
@@ -10069,10 +12709,6 @@ def node_install_peer(node, iface_name, mirror, *, public_key, requested_address
             body = getattr(getattr(e, 'response', None), 'text', '') or ''
             agent_code = _node_agent_error_code(getattr(e, 'response', None))
 
-            # The pool is genuinely empty. Never retry; let the caller surface
-            # the documented address_pool_exhausted code. The second clause is
-            # the fallback for an older agent that has no structured `error`
-            # code and only says "pool" in prose.
             if (
                 agent_code == 'address_pool_exhausted'
                 or (status == 409 and not host_cidr and 'pool' in body)
@@ -10082,20 +12718,15 @@ def node_install_peer(node, iface_name, mirror, *, public_key, requested_address
                     f'The node interface {iface_name} has no free client address.',
                 )
 
-            # An explicit address collided: surface it instead of substituting.
             if requested_address and status in (400, 409):
                 raise NodePeerInstallError(
                     'address_conflict', 409,
                     f'The requested address is not available on {iface_name}.',
                 )
 
-            # Older agent that still needs host_cidr in the payload: supply one
-            # and retry. Only when the caller did not pin an address.
             needs_panel_side_address = (
                 status == 400 and not host_cidr and 'host_cidr' in body
             )
-            # A peer took our auto-picked host between pick and install: re-pick
-            # and retry. Bounded by `attempts`; not done for explicit requests.
             retryable_conflict = (
                 agent_code == 'host_cidr_already_used'
                 and not requested_address
@@ -10111,8 +12742,6 @@ def node_install_peer(node, iface_name, mirror, *, public_key, requested_address
         except NodePeerInstallError:
             raise
         except AddressAllocationError:
-            # _node_pick_available_ip / allocate_peer_address can raise these;
-            # let them propagate so the caller maps them via address_error_response.
             raise
         except Exception as e:
             raise NodePeerInstallError('node_create_failed', 502, str(e))
@@ -10142,7 +12771,6 @@ def node_install_peer(node, iface_name, mirror, *, public_key, requested_address
 
 
 def node_reapply_peer(peer):
-    """Upsert a panel peer into its node's runtime and durable config."""
     iface = getattr(peer, 'iface', None)
     node = getattr(iface, 'node', None)
     if iface is None or node is None:
@@ -10184,12 +12812,7 @@ def node_reapply_peer(peer):
 
 
 def _node_agent_error_code(response):
-    """Best-effort parse of the agent's structured ``error`` code from a 4xx/5xx body.
 
-    The agent returns ``{"error": "...", "detail": "..."}``. Older agents or
-    proxies may return plain text, in which case ``''`` is returned and callers
-    fall back to substring matching.
-    """
     if response is None:
         return ''
     try:
@@ -10202,7 +12825,6 @@ def _node_agent_error_code(response):
 
 
 def _node_pick_available_ip(node, iface_name, mirror):
-    """Ask a node for a free address, falling back to the panel's mirror view."""
     try:
         available = node_get(node, f'/api/iface/{iface_name}/available_ips')
         if isinstance(available, dict):
@@ -10223,7 +12845,6 @@ def _node_pick_available_ip(node, iface_name, mirror):
 
 def ensure_node_mirror_iface(node, iface_name, remote_iface=None, *, mtu=None, dns=None,
                              listen_port=None, server_cidr=None):
-    """Return (creating or refreshing) the panel's mirror row for a node interface."""
     remote_iface = remote_iface or {}
     db_iface_name = f'n{node.id}:{iface_name}'
     iface = InterfaceConfig.query.filter_by(name=db_iface_name).first()
@@ -10274,13 +12895,7 @@ def ensure_node_mirror_iface(node, iface_name, remote_iface=None, *, mtu=None, d
 
 
 def resolve_requested_peer_address(iface, value, *, allow_legacy_interface_address=False):
-    """Validate a requested peer address without silently reinterpreting it.
 
-    Only the legacy generic ``address`` field may contain the interface's own
-    ``Address`` value; callers opt into ignoring that exact value. The explicit
-    ``peer_address`` field is always strict, so malformed or reserved input is
-    returned as a structured 400 instead of unexpectedly auto-allocating.
-    """
     text = str(value or '').strip()
     if not text:
         return None
@@ -10302,7 +12917,6 @@ def resolve_requested_peer_address(iface, value, *, allow_legacy_interface_addre
 
 
 def requested_peer_address_from_target(iface, target):
-    """Resolve strict ``peer_address`` before the legacy ``address`` alias."""
     explicit = str((target or {}).get('peer_address') or '').strip()
     if explicit:
         return resolve_requested_peer_address(iface, explicit)
@@ -10315,7 +12929,6 @@ def requested_peer_address_from_target(iface, target):
 
 
 def peer_address_host(address):
-    """Canonical host string stored in ``Peer.address_host`` (``None`` if unparseable)."""
     host = _safe_ip(address)
     return str(host) if host is not None else None
 
@@ -10323,17 +12936,7 @@ def peer_address_host(address):
 @event.listens_for(Peer, 'before_insert')
 @event.listens_for(Peer, 'before_update')
 def _keep_peer_address_host_in_sync(mapper, connection, target):
-    """Derive the canonical host from ``address`` on every write.
-
-    Doing it here means the uniqueness invariant holds for every code path,
-    including direct edits through /api/peer/<id>.
-
-    Note: ``address_host`` is a derived, system-owned column. It must never be
-    hand-edited: this listener unconditionally re-derives it from ``address``,
-    so a manual fix to ``address_host`` alone is reverted on the next unrelated
-    edit of the row (review finding #5). Recover from duplicate hosts via the
-    migration in ``_backfill_peer_address_hosts``, which blanks the losers.
-    """
+  
     target.address_host = peer_address_host(target.address)
 
 
@@ -10342,12 +12945,7 @@ _ALLOC_LOCK_DIR = os.path.join(app.instance_path, 'locks')
 
 @contextmanager
 def interface_allocation_lock(iface):
-    """Serialise allocate-then-install for one interface across workers.
-
-    A plain database read cannot prevent two gunicorn workers from picking the
-    same free host, so the whole critical section is guarded by a per-interface
-    ``flock``. The database unique constraint is the backstop.
-    """
+ 
     name = re.sub(r'[^A-Za-z0-9_.:-]+', '_', str(getattr(iface, 'name', '') or 'iface'))
     handle = None
     try:
@@ -10355,8 +12953,6 @@ def interface_allocation_lock(iface):
         handle = open(os.path.join(_ALLOC_LOCK_DIR, f'{name}.alloc.lock'), 'w')
         fcntl.flock(handle, fcntl.LOCK_EX)
     except Exception:
-        # A missing lock file must not stop peer creation; the unique
-        # constraint still rejects a duplicate host.
         current_app.logger.warning('Could not take allocation lock for %s', name, exc_info=True)
         handle = None
 
@@ -10372,11 +12968,7 @@ def interface_allocation_lock(iface):
 
 
 def _available_ips(iface, limit=MAX_ENUMERATED_HOSTS):
-    """Free client addresses on ``iface``, in ascending order.
 
-    Same reservation rules as :func:`allocate_peer_address`, so the picker in
-    the UI and the server-side allocator can never disagree.
-    """
     if not iface:
         return []
 
@@ -10452,7 +13044,6 @@ def _norm_conftext(txt: str) -> str:
 
 
 def _write_conf_atomic(conf_path: str, text_body: str):
-    """Replace ``conf_path`` atomically, preserving its mode (default 0600)."""
     directory = os.path.dirname(conf_path) or '.'
     os.makedirs(directory, exist_ok=True)
 
@@ -10480,16 +13071,6 @@ def _write_conf_atomic(conf_path: str, text_body: str):
 
 
 def _peer_to_conf(peer: Peer):
-    """Write ``peer``'s ``[Peer]`` block into the SERVER's interface config.
-
-    The block deliberately carries no ``Endpoint`` unless the operator set an
-    explicit ``peer_endpoint``: ``Peer.endpoint`` is the *server's* address as
-    exported to the client, and writing it here would make the server send the
-    client's traffic to itself. See wg(8): ``Endpoint`` is the remote peer's
-    address, and WireGuard learns a roaming client's endpoint on its own.
-
-    Raises on failure so callers can compensate.
-    """
     conf_path = getattr(peer.iface, 'path', None)
     if not conf_path:
         raise RuntimeError('The interface has no configuration file path.')
@@ -10526,11 +13107,7 @@ def _peer_to_conf(peer: Peer):
 
 
 def _remove_peer(peer: Peer):
-    """Drop ``peer``'s ``[Peer]`` block from the server's interface config.
 
-    Raises if the block is still present afterwards, so a caller never reports
-    success on a peer that a later ``wg-quick up`` would bring back.
-    """
     conf_path = getattr(peer.iface, 'path', None)
     if not conf_path:
         return
@@ -10572,7 +13149,6 @@ def _sync_peer(peer: Peer):
 
 
 def _wg_disable_quiet(peer: Peer):
-    """Best-effort runtime removal used to undo a half-finished create."""
     try:
         _wg_disable(peer)
     except Exception:
@@ -10585,7 +13161,6 @@ def _wg_disable_quiet(peer: Peer):
 
 
 def _remove_peer_quiet(peer: Peer):
-    """Best-effort config removal used to undo a half-finished create."""
     try:
         _remove_peer(peer)
     except Exception:
@@ -10597,7 +13172,6 @@ def _remove_peer_quiet(peer: Peer):
 
 
 def _rollback_local_created_peer(peer: Peer):
-    """Remove both local side effects created before a database commit."""
     errors = []
     dev = iface_devname(peer.iface) if getattr(peer, 'iface', None) else ''
     if dev and _iface_up(dev):
@@ -10618,7 +13192,6 @@ def _rollback_local_created_peer(peer: Peer):
 
 
 def _rollback_node_created_peer(node, public_key):
-    """Convergently remove a node peer created before a database commit."""
     response = node_delete(node, f'/api/peer/{public_key}') or {}
     if isinstance(response, dict) and response.get('ok') is False:
         raise RuntimeError(
@@ -10627,7 +13200,6 @@ def _rollback_node_created_peer(node, public_key):
 
 
 class PeerCreateCompensation:
-    """Reverse external peer installs when a surrounding transaction fails."""
 
     def __init__(self):
         self._actions = []
@@ -10661,11 +13233,6 @@ class PeerCreateCompensation:
 
 
 class PeerRemovalError(Exception):
-    """A peer could not be fully removed; the database row was kept.
-
-    ``phase`` says which layer failed ('runtime', 'config' or 'node') so an
-    operator - or a retry - knows what still needs cleaning up.
-    """
 
     def __init__(self, phase, message, status=500):
         super().__init__(message)
@@ -10681,7 +13248,6 @@ def _peer_is_on_node(peer: Peer) -> bool:
 
 
 def reapply_peer_external(peer: Peer):
-    """Make runtime and durable config match the current in-memory peer row."""
     if _peer_is_on_node(peer):
         node_reapply_peer(peer)
         return
@@ -10691,17 +13257,7 @@ def reapply_peer_external(peer: Peer):
 
 
 def remove_peer_everywhere(peer: Peer):
-    """Remove a peer from runtime, durable config and the database.
 
-    Order matters: runtime first (so no traffic keeps flowing while the rest
-    happens), then the durable config (so a later `wg-quick up` cannot bring
-    the peer back), then the database rows in one transaction. If either
-    WireGuard layer cannot be verified the database row is deliberately kept
-    and ``PeerRemovalError`` is raised, because the row is the only handle
-    left for retrying.
-
-    Returns the number of shortlinks that were removed with the peer.
-    """
     if _peer_is_on_node(peer):
         _remove_node_peer(peer)
     else:
@@ -10713,7 +13269,6 @@ def remove_peer_everywhere(peer: Peer):
 def _remove_local_peer_runtime_and_config(peer: Peer):
     dev = iface_devname(peer.iface) if getattr(peer, 'iface', None) else ''
 
-    # A down interface has no runtime peer to remove, and that is not a failure.
     if dev and _iface_up(dev):
         try:
             _wg_disable(peer)
@@ -10751,7 +13306,6 @@ def _remove_node_peer(peer: Peer):
             'node', str(response.get('error') or 'The node reported a failure.'), 502
         )
 
-    # Newer agents report each layer; older ones only report ok=True.
     for key, phase in (('runtime_removed', 'runtime'), ('config_removed', 'config')):
         if key in response and not response.get(key):
             raise PeerRemovalError(
@@ -10762,7 +13316,6 @@ def _remove_node_peer(peer: Peer):
 
 
 def _wg_peer_keys(dev: str) -> set:
-    """Public keys currently configured on a running interface."""
     keys = set()
     try:
         out = subprocess.check_output(
@@ -10780,11 +13333,7 @@ def _wg_peer_keys(dev: str) -> set:
 
 
 def _delete_peer_rows(peer: Peer):
-    """Drop the peer and everything that points at it, in one transaction.
 
-    Returns the number of shortlinks removed, so callers can report the real
-    count instead of assuming one.
-    """
     try:
         removed_shortlinks = _delete_shortlinks_for_peer_ids([peer.id])
         SubscriptionPeer.query.filter_by(peer_id=peer.id).delete(synchronize_session=False)
@@ -10798,7 +13347,6 @@ def _delete_peer_rows(peer: Peer):
 
 
 def peer_removal_response(exc: PeerRemovalError, peer_id=None):
-    """Structured error for a removal that left recoverable state behind."""
     return jsonify(
         ok=False,
         error='peer_removal_failed',
@@ -10810,12 +13358,7 @@ def peer_removal_response(exc: PeerRemovalError, peer_id=None):
 
 
 def install_local_peer(peer: Peer):
-    """Install a peer into the running interface and its durable config.
 
-    Runtime first, because ``wg set`` validates the device and the address;
-    durable config second. If either step fails, both are undone so a failed
-    create cannot leave an invisible peer behind. Raises on failure.
-    """
     _check_iface_up(peer.iface)
     _wg_enable(peer)
 
@@ -10885,6 +13428,133 @@ def _panel_base() -> str:
 
 PANEL_SETTINGS_FILE = os.path.join(app.instance_path, "panel_settings.json")
 
+def _valid_timezone_name(value: str) -> str | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(value)
+        return value
+    except Exception:
+        return None
+
+
+def _detect_system_timezone_name() -> str:
+
+    try:
+        backup_file = globals().get("BACKUP_SCHEDULE_FILE")
+        if backup_file and os.path.isfile(backup_file):
+            data = _json_load(backup_file, {})
+            candidate = _valid_timezone_name(
+                data.get("timezone")
+            )
+            if candidate:
+                return candidate
+    except Exception:
+        pass
+
+    try:
+        with open(
+            "/etc/timezone",
+            "r",
+            encoding="utf-8",
+        ) as timezone_file:
+            candidate = _valid_timezone_name(
+                timezone_file.read().strip()
+            )
+            if candidate:
+                return candidate
+    except Exception:
+        pass
+
+    try:
+        target = os.path.realpath(
+            "/etc/localtime"
+        )
+
+        marker = "/zoneinfo/"
+
+        if marker in target:
+            candidate = _valid_timezone_name(
+                target.split(
+                    marker,
+                    1,
+                )[1]
+            )
+
+            if candidate:
+                return candidate
+    except Exception:
+        pass
+
+    try:
+        tzinfo = (
+            datetime.now()
+            .astimezone()
+            .tzinfo
+        )
+
+        candidate = _valid_timezone_name(
+            getattr(
+                tzinfo,
+                "key",
+                "",
+            )
+        )
+
+        if candidate:
+            return candidate
+    except Exception:
+        pass
+
+    return "UTC"
+
+
+def _panel_timezone_name() -> str:
+    """
+    Single timezone source for the whole panel.
+    """
+    try:
+        settings = _load_panel_settings() or {}
+
+        candidate = _valid_timezone_name(
+            settings.get("timezone")
+        )
+
+        if candidate:
+            return candidate
+    except Exception:
+        pass
+
+    return _detect_system_timezone_name()
+
+
+def _panel_timezone():
+    from zoneinfo import ZoneInfo
+
+    try:
+        return ZoneInfo(
+            _panel_timezone_name()
+        )
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _panel_local_datetime(value):
+
+    parsed = _tg_parse_datetime(
+        value
+    )
+
+    if parsed is None:
+        return None
+
+    return parsed.astimezone(
+        _panel_timezone()
+    )
+
 def _load_panel_settings():
     os.makedirs(app.instance_path, exist_ok=True)
     try:
@@ -10902,16 +13572,31 @@ def _load_panel_settings():
         except Exception:
             return default
 
-    return {
-        "tls_enabled": bool(j.get("tls_enabled", False)),
-        "domain": (j.get("domain") or "").strip(),
-        "force_https_redirect": bool(j.get("force_https_redirect", False)),
-        "hsts": bool(j.get("hsts", False)),
-        "http_port": _port(j.get("http_port"), None),
-        "https_port": _port(j.get("https_port"), 443),
-        "tls_cert_path": (j.get("tls_cert_path") or "").strip(),
-        "tls_key_path": (j.get("tls_key_path") or "").strip(),
-    }
+    timezone_name = _valid_timezone_name(
+    j.get("timezone")
+)
+
+    if not timezone_name:
+        timezone_name = (_detect_system_timezone_name())
+
+    return {"tls_enabled": bool(j.get("tls_enabled",False,)),
+
+        "domain": (j.get("domain")or "").strip(),
+
+        "force_https_redirect": bool(j.get("force_https_redirect",False,)),
+
+        "hsts": bool(j.get("hsts",False,)),
+
+        "http_port": _port(j.get("http_port"),None,),
+
+        "https_port": _port(j.get("https_port"),443,),
+
+        "tls_cert_path": (j.get("tls_cert_path")or "").strip(),
+
+        "tls_key_path": (j.get("tls_key_path")or "").strip(),
+
+        "timezone": timezone_name,
+        }
 
 def _is_https(req=None) -> bool:
     """
@@ -11128,7 +13813,6 @@ def _parse_endpoint_host(value):
     candidate = value[1:-1] if bracketed else value
 
     try:
-        # Stored bare and compressed so one host has one spelling.
         return ipaddress.ip_address(candidate).compressed
     except ValueError:
         pass
@@ -11140,7 +13824,6 @@ def _parse_endpoint_host(value):
         )
 
     if ':' in candidate:
-        # Not an IP and still has a colon: an embedded port, not a guess.
         raise EndpointValidationError(
             'endpoint_host_has_port',
             'Put the port in the port field; the host must not contain one.',
@@ -11188,13 +13871,7 @@ def _parse_endpoint_port(value):
 
 
 def parse_endpoint_override(host, port):
-    """Validate an interface endpoint override.
 
-    Returns ``(host, port)`` normalised, or ``(None, None)`` when both inputs
-    are empty, which means "clear the override". A partial pair is rejected:
-    merge semantics would let two edits made at different times silently
-    combine into a working endpoint nobody reviewed.
-    """
     host_raw = '' if host is None else str(host).strip()
     port_raw = '' if port is None else str(port).strip()
 
@@ -11211,13 +13888,7 @@ def parse_endpoint_override(host, port):
 
 
 def parse_endpoint_string(value):
-    """Validate an explicit ``host:port`` endpoint and return it normalised.
 
-    Returns '' for an empty value. Not applied to the existing create routes -
-    they accept free-form endpoints today and tightening that without a
-    compatibility review would be an unguarded behaviour change. Available for
-    a later spec.
-    """
     text_value = (value or '').strip()
     if not text_value:
         return ''
@@ -11249,8 +13920,7 @@ def iface_endpoint_override(iface):
 
     if not host or not port:
         if host or port:
-            # A hand-edited row degrades to auto-detection instead of
-            # producing a malformed endpoint.
+
             current_app.logger.warning(
                 'Interface %s has an incomplete endpoint override '
                 '(host=%r port=%r); ignoring it.',
@@ -11261,17 +13931,30 @@ def iface_endpoint_override(iface):
     return _norm_hostport(host, int(port))
 
 
-def resolve_client_endpoint(iface, explicit=None, *, node=None, remote_iface=None):
-    """The server address written into a CLIENT's [Peer] block.
+def _safe_explicit_endpoint(explicit):
+    """A stored per-peer endpoint, or '' when it is not a clean host:port.
 
-    Precedence: explicit value, then the interface's saved override, then
-    auto-detection, then ''. This is the only place that rule lives; every
-    create and export path must come through here.
-
-    Never pass the result to `wg set ... peer ... endpoint` or into a server or
-    node [Peer] block - see `_peer_to_conf`.
+    Rendered configs are served over public subscription links, so a value
+    carrying newlines would add attacker-chosen lines to the client's
+    ``[Peer]`` block. Rows written before validation existed are dropped here
+    rather than trusted.
     """
     explicit = (explicit or '').strip()
+    if not explicit:
+        return ''
+
+    try:
+        return parse_endpoint_string(explicit)
+    except EndpointValidationError as exc:
+        current_app.logger.warning(
+            'Ignoring malformed peer endpoint %r: %s', explicit, exc.detail,
+        )
+        return ''
+
+
+def resolve_client_endpoint(iface, explicit=None, *, node=None, remote_iface=None):
+
+    explicit = _safe_explicit_endpoint(explicit)
     if explicit:
         return explicit
 
@@ -11280,8 +13963,7 @@ def resolve_client_endpoint(iface, explicit=None, *, node=None, remote_iface=Non
 
     override = iface_endpoint_override(iface)
     if override:
-        # Returning here also skips the node round-trips below, so exporting a
-        # config for a peer on an unreachable node still works.
+
         return override
 
     try:
@@ -11303,17 +13985,8 @@ def resolve_client_endpoint(iface, explicit=None, *, node=None, remote_iface=Non
 
 
 def resolve_client_endpoint_cheap(iface, explicit=None):
-    """`resolve_client_endpoint`, minus any per-call network round-trip.
 
-    Precedence: explicit value, then the interface's saved override, then -
-    for a local interface only - cheap local auto-detection. A node
-    interface with no override returns '': node auto-detection
-    (`_node_endpoint_fallback`) makes up to two HTTP calls to the node, and
-    doing that per row would turn a peer listing into a multi-minute stall
-    whenever a node is slow or unreachable. The full value still resolves at
-    export time via `resolve_client_endpoint`; this is display-only.
-    """
-    explicit = (explicit or '').strip()
+    explicit = _safe_explicit_endpoint(explicit)
     if explicit:
         return explicit
 
@@ -11575,11 +14248,7 @@ def node_peer_delete(nid, pub):
     return jsonify(ok=True, shortlinks_removed=removed_shortlinks)
 
 def _effective_client_endpoint(peer: Peer) -> str:
-    """The server/node ``host:port`` that goes into the CLIENT's [Peer] block.
 
-    This is the client-facing server endpoint, not the server-side peer
-    endpoint - see :func:`_peer_to_conf`.
-    """
     return resolve_client_endpoint(
         getattr(peer, 'iface', None),
         explicit=getattr(peer, 'endpoint', None),
@@ -12015,47 +14684,21 @@ def _expire():
                     )
 
                 pending_notifications.append({
-                    'event_key': 'peer_expired',
-                    'title': '● Peer expired',
-                    'status': 'Disabled',
-                    'details': [
-                        (
-                            'Peer',
-                            peer_name,
-                        ),
-                        (
-                            'Location',
-                            (
-                                node_name
-                                or 'Local panel'
-                            ),
-                        ),
-                        (
-                            'Interface',
-                            interface_name,
-                        ),
-                        (
-                            'Address',
-                            getattr(
-                                peer,
-                                'address',
-                                '',
-                            ),
-                        ),
-                        (
-                            'Expired at',
-                            isoz(
-                                from_ts(
-                                    expiry_ts
-                                )
-                            ),
-                        ),
-                    ],
-                    'dedupe_key': (
-                        f'peer-expired:{peer.id}'
-                    ),
-                    'dedupe_seconds': 0,
-                })
+                'event_key': 'peer_expired',
+                'title': 'Peer expired',
+                'status': 'Disabled',
+ 
+                'details': [('Peer',f'{peer_name} · ID {peer.id}',),
+                ('Location',node_name or 'Local panel',),
+                ('Interface',interface_name,),
+                ('Address',getattr(peer,'address','',) or '',),
+                ('Phone',getattr(peer,'phone_number','',) or '',),
+                ('Telegram',getattr(peer,'telegram_id','',) or '',),
+                ('Active since',_tg_human_datetime(getattr(peer,'first_used_at',None,)),),
+                ('Expired at',_tg_human_datetime(from_ts(expiry_ts)),),],
+
+                'dedupe_key': (f'peer-expired:{peer.id}'),
+                'dedupe_seconds': 0,})
 
             changed = True
 
@@ -12145,50 +14788,22 @@ def _expire():
                     )
 
                 pending_notifications.append({
-                    'event_key': 'peer_limit',
-                    'title': (
-                        '● Peer traffic limit reached'
-                    ),
-                    'status': 'Disabled',
-                    'details': [
-                        (
-                            'Peer',
-                            peer_name,
-                        ),
-                        (
-                            'Location',
-                            (
-                                node_name
-                                or 'Local panel'
-                            ),
-                        ),
-                        (
-                            'Interface',
-                            interface_name,
-                        ),
-                        (
-                            'Address',
-                            getattr(
-                                peer,
-                                'address',
-                                '',
-                            ),
-                        ),
-                        (
-                            'Used bytes',
-                            used_effective,
-                        ),
-                        (
-                            'Limit bytes',
-                            limit_bytes,
-                        ),
-                    ],
-                    'dedupe_key': (
-                        f'peer-limit:{peer.id}'
-                    ),
-                    'dedupe_seconds': 0,
-                })
+                'event_key': 'peer_limit',
+                'title': 'Peer traffic limit reached',
+                'status': 'Disabled',
 
+                'details': [('Peer',f'{peer_name} · ID {peer.id}',),
+                ('Location',node_name or 'Local panel',),
+                ('Interface',interface_name,),
+                ('Address',getattr(peer,'address','',) or '',),
+                ('Phone',getattr(peer,'phone_number','',) or '',),
+                ('Telegram',getattr(peer,'telegram_id','',) or '',),
+                ('Usage',_tg_human_bytes(used_effective),),
+                ('Data limit',_tg_human_bytes(limit_bytes),),
+                ('Active since',_tg_human_datetime(getattr(peer,'first_used_at',None,)),),],
+
+                'dedupe_key': (f'peer-limit:{peer.id}'),
+                'dedupe_seconds': 0,})
             changed = True
 
     if not changed:
@@ -12408,9 +15023,7 @@ def repoint_endpoints():
 
     changed = 0
     for p in Peer.query.all():
-        # An interface override is an operator decision. A public IP change
-        # must not drag peers off it, even when the override happens to be the
-        # old public IP.
+
         override = iface_endpoint_override(getattr(p, 'iface', None))
         if override and (p.endpoint or '').strip() == override:
             continue
@@ -12429,20 +15042,6 @@ def repoint_endpoints():
 # Bootstrap
 # ___________
 def _migrate_schema():
-    """Bring the database up to the schema this build maps, or raise.
-
-    Order matters. Everything here that loads a model through the ORM selects
-    every mapped column, so each ALTER TABLE has to run before the first query
-    that depends on it. In particular `_shortlink_schema()` ->
-    `_migrate_shortlinks_json_to_db()` loads `Peer`, which now maps
-    `address_host` and `peer_endpoint`; running it ahead of `_peer_schema()`
-    fails with "no such column" on any database created before those columns
-    existed.
-
-    Raises `SchemaMigrationError` on any failure. Serving traffic against a
-    half-migrated database is worse than not starting: every peer query would
-    fail, and the panel would keep answering as though it were healthy.
-    """
     try:
         db.create_all()
         _admin_columns()
@@ -12459,19 +15058,49 @@ def bootstrap():
     with app.app_context():
         _migrate_schema()
         from models import InterfaceConfig
+        firewall_summary = (
+            local_firewall_rules()
+        )
+        app.logger.info("Legacy local firewall migration: %s",firewall_summary,)
+        p = (
+            app.config.get("WG_CONF_PATH")
+            or app.config.get(
+                "WIREGUARD_CONF_PATH"
+            )
+            or "/etc/wireguard")
 
-        p = (app.config.get('WG_CONF_PATH')
-             or app.config.get('WIREGUARD_CONF_PATH')
-             or '/etc/wireguard')
-        paths = glob.glob(os.path.join(p, '*.conf')) if os.path.isdir(p) \
-              else ([p] if os.path.isfile(p) else [])
+        paths = (
+            glob.glob(os.path.join(p,"*.conf",))
+            if os.path.isdir(p)
+            else (
+                [p]
+                if os.path.isfile(p)
+                else []
+            )
+        )
         for conf in paths:
+            parsed = find_iface(conf)
+            if not parsed:
+                continue
             name = os.path.splitext(os.path.basename(conf))[0]
-            if not InterfaceConfig.query.filter_by(name=name).first():
-                iface = find_iface(conf)
-                if iface:
-                    db.session.add(iface)
+            existing = (InterfaceConfig.query.filter_by(name=name).first())
+            if not existing:
+                db.session.add(parsed)
+                continue
+            existing.path = parsed.path
+            existing.address = parsed.address
+            existing.listen_port = (
+                parsed.listen_port
+            )
+            existing.private_key = (
+                parsed.private_key
+            )
+            existing.mtu = parsed.mtu
+            existing.dns = parsed.dns
+            existing.post_up = parsed.post_up
+            existing.post_down = parsed.post_down
         db.session.commit()
+
 
         _on_boot()
         _run_expiry_once('boot')
@@ -12624,10 +15253,7 @@ def _peer_ip_plain(peer) -> str:
 
 
 def _peer_ping_ok(peer, timeout_sec: float = 0.8) -> bool:
-    """
-    Active reachability check over the WireGuard interface.
-    This detects peers that are reachable through a tunnel even when the public endpoint/handshake is misleading.
-    """
+
     ip = _peer_ip_plain(peer)
     if not ip:
         return False
@@ -13405,47 +16031,32 @@ def node_ifaces(nid):
         mirror = InterfaceConfig.query.filter_by(name=f'n{nid}:{name}').first()
 
         if mirror is not None:
-            # Built by hand rather than via `_endpoint_default_payload`: that
-            # helper always calls `_node_endpoint_fallback` for its auto
-            # value, which costs up to two node HTTP calls. This loop already
-            # runs one `node_get` per interface below (available_ips), so a
-            # second per-row round-trip would make the whole listing stall
-            # whenever the node is slow or down. Auto-detection is left to
-            # export time, same as `resolve_client_endpoint_cheap`.
-            #
-            # Keep in sync with `_endpoint_default_payload`: the only
-            # intentional difference is `auto_endpoint` staying `''` here,
-            # because the probe that would fill it in is deliberately
-            # skipped rather than run per row.
+
             override = iface_endpoint_override(mirror)
             host = (getattr(mirror, 'endpoint_host', None) or '').strip() or None
             port = getattr(mirror, 'endpoint_port', None)
 
+            # This listing skips auto-detection (it would add a probe per
+            # interface), so it can only report an override. 'none' keeps the
+            # UI honest; the per-interface endpoint-default route fills in the
+            # auto-detected value.
             item.update({
                 'endpoint_host': host,
                 'endpoint_port': int(port) if port else None,
                 'endpoint_override': override,
                 'auto_endpoint': '',
                 'effective_endpoint': override,
-                # 'auto' (not 'none') when there is no override: detection
-                # was never attempted here, so nothing has been established
-                # about what auto-detection would return. 'none' would
-                # assert a negative the panel hasn't checked; export time
-                # may still resolve an endpoint. See the module-level rule
-                # in `_endpoint_default_payload`'s docstring neighbourhood.
-                'endpoint_source': 'override' if override else 'auto',
+                'endpoint_source': 'override' if override else 'none',
             })
         else:
-            # Not mirrored yet: no override is possible, and the probe is
-            # skipped for the same reason as above. 'auto': export time
-            # decides.
+
             item.update({
                 'endpoint_host': None,
                 'endpoint_port': None,
                 'endpoint_override': '',
                 'auto_endpoint': '',
                 'effective_endpoint': '',
-                'endpoint_source': 'auto',
+                'endpoint_source': 'none',
             })
 
         try:
@@ -13706,7 +16317,7 @@ def node_iface_delete(nid, name):
     )
 
 @app.route('/api/iface/<int:iid>', methods=['GET', 'POST'])
-@login_required
+@require_api_key_or_login
 def iface_settings(iid):
     iface = db.session.get(InterfaceConfig, iid) or abort(404)
 
@@ -13945,8 +16556,7 @@ def iface_settings(iid):
 
                 if stripped.startswith('[') and stripped.endswith(']'):
                     if in_interface:
-                        if 'dns' in updates and updates['dns']:
-                            output.append(f"DNS = {updates['dns']}\n")
+                    
                         if 'mtu' in updates and updates['mtu'] is not None:
                             output.append(f"MTU = {updates['mtu']}\n")
                         if 'listen_port' in updates:
@@ -13980,8 +16590,7 @@ def iface_settings(iid):
                 output.append(raw)
 
             if in_interface:
-                if 'dns' in updates and updates['dns']:
-                    output.append(f"DNS = {updates['dns']}\n")
+            
                 if 'mtu' in updates and updates['mtu'] is not None:
                     output.append(f"MTU = {updates['mtu']}\n")
                 if 'listen_port' in updates:
@@ -14115,12 +16724,7 @@ def iface_settings(iid):
 
 
 def _endpoint_default_payload(iface, *, scope=None, node=None, remote_iface=None):
-    """One shape for every response reporting an interface's endpoint default.
 
-    `endpoint_override` is what the operator saved; `auto_endpoint` is what
-    detection would return. They are reported separately and never collapsed,
-    so "I set this" stays distinguishable from "the panel guessed this".
-    """
     if scope is None:
         scope = 'node' if getattr(iface, 'node_id', None) is not None else 'local'
 
@@ -14139,7 +16743,6 @@ def _endpoint_default_payload(iface, *, scope=None, node=None, remote_iface=None
         else:
             auto = (_endpoint_fallback(iface) or '').strip()
     except Exception:
-        # A node that is down must never stop an operator reading the override.
         current_app.logger.debug(
             'Endpoint auto-detection unavailable for %s',
             getattr(iface, 'name', '?'), exc_info=True,
@@ -14173,17 +16776,45 @@ def _endpoint_default_payload(iface, *, scope=None, node=None, remote_iface=None
     return payload
 
 
-@app.get('/api/iface/<int:iid>/endpoint-default')
-@require_api_key_or_login
-def api_iface_endpoint_default_get(iid):
+def _local_iface_or_error(iid):
+    """(iface, None) for a local interface, else (None, error response).
+
+    Node mirror rows are addressable by id but must go through the node API,
+    which also checks that the node is reachable. Mirrors the guard in
+    ``iface_settings``.
+    """
     iface = db.session.get(InterfaceConfig, iid)
 
     if iface is None:
-        return jsonify(
+        return None, (jsonify(
             ok=False,
             error='iface_not_found',
             detail=f'Interface {iid} was not found.',
-        ), 404
+        ), 404)
+
+    if (
+        getattr(iface, 'node_id', None) is not None
+        or ':' in (getattr(iface, 'name', '') or '')
+    ):
+        return None, (jsonify(
+            ok=False,
+            error='remote_interface',
+            detail=(
+                'This interface belongs to a remote node. '
+                'Use the node interface API instead.'
+            ),
+        ), 400)
+
+    return iface, None
+
+
+@app.get('/api/iface/<int:iid>/endpoint-default')
+@require_api_key_or_login
+def api_iface_endpoint_default_get(iid):
+    iface, error = _local_iface_or_error(iid)
+
+    if error is not None:
+        return error
 
     return jsonify(ok=True, **_endpoint_default_payload(iface))
 
@@ -14191,14 +16822,10 @@ def api_iface_endpoint_default_get(iid):
 @app.put('/api/iface/<int:iid>/endpoint-default')
 @require_api_key_or_login
 def api_iface_endpoint_default_put(iid):
-    iface = db.session.get(InterfaceConfig, iid)
+    iface, error = _local_iface_or_error(iid)
 
-    if iface is None:
-        return jsonify(
-            ok=False,
-            error='iface_not_found',
-            detail=f'Interface {iid} was not found.',
-        ), 404
+    if error is not None:
+        return error
 
     data = request.get_json(silent=True)
 
@@ -14238,13 +16865,7 @@ class NodeIfaceLookupError(Exception):
 
 
 def _node_mirror_for_endpoint_default(node, name):
-    """Return (mirror row, remote interface dict) for a node interface.
 
-    Creates the mirror when the panel has not seen this interface yet, but only
-    from data the node actually reported: `ensure_node_mirror_iface` otherwise
-    defaults the address to 10.0.0.1/24, and persisting that invented value
-    would corrupt later allocation.
-    """
     db_name = f'n{node.id}:{name}'
     iface = InterfaceConfig.query.filter_by(name=db_name).first()
 
@@ -14300,9 +16921,6 @@ def api_node_iface_endpoint_default_get(nid, name):
             **_endpoint_default_payload(iface, scope='node', node=node),
         )
 
-    # Not mirrored yet, so there is no override to report. Auto-detection still
-    # tells the operator what peers would get today. A GET must not create rows
-    # and must not fail because a node is down.
     try:
         auto = (_node_endpoint_fallback(node, name) or '').strip()
     except Exception:
@@ -14383,12 +17001,7 @@ class EndpointApplyError(Exception):
 
 def _apply_endpoint_default(iface, *, dry_run, overwrite_explicit,
                             scope='local', node=None, remote_iface=None):
-    """Stamp the interface's effective endpoint onto its existing peers.
 
-    This writes only `Peer.endpoint`. It touches no runtime, no server config
-    and no node, so there is no per-peer failure mode: either the single
-    transaction commits or nothing changes.
-    """
     effective = resolve_client_endpoint(iface, node=node, remote_iface=remote_iface)
 
     if not effective:
@@ -14400,16 +17013,10 @@ def _apply_endpoint_default(iface, *, dry_run, overwrite_explicit,
 
     peers = Peer.query.filter_by(iface_id=iface.id).all()
     explicit = [p for p in peers if (p.endpoint or '').strip()]
-
-    # Candidates before the no-op filter: every peer when overwriting
-    # explicit values, otherwise only peers with no endpoint of their own.
     candidates = peers if overwrite_explicit else [
         p for p in peers if not (p.endpoint or '').strip()
     ]
 
-    # Drop peers whose endpoint already equals the value we would write, so
-    # `updated`/`would_update` count actual changes rather than rows that
-    # merely get dirtied and re-flushed (review finding #6).
     targets = [p for p in candidates if (p.endpoint or '').strip() != effective]
 
     result = {
@@ -14441,7 +17048,6 @@ def _apply_endpoint_default(iface, *, dry_run, overwrite_explicit,
 
 
 def _apply_request_flags(data):
-    """(dry_run, overwrite_explicit) from an apply request body."""
     data = data if isinstance(data, dict) else {}
     return (
         _sub_bool(data.get('dry_run')),
@@ -14452,13 +17058,10 @@ def _apply_request_flags(data):
 @app.post('/api/iface/<int:iid>/endpoint-default/apply')
 @require_api_key_or_login
 def api_iface_endpoint_default_apply(iid):
-    iface = db.session.get(InterfaceConfig, iid)
+    iface, error = _local_iface_or_error(iid)
 
-    if iface is None:
-        return jsonify(
-            ok=False, error='iface_not_found',
-            detail=f'Interface {iid} was not found.',
-        ), 404
+    if error is not None:
+        return error
 
     dry_run, overwrite_explicit = _apply_request_flags(
         request.get_json(silent=True)
@@ -14497,9 +17100,7 @@ def api_node_iface_endpoint_default_apply(nid, name):
     remote = None
 
     if dry_run:
-        # A dry run must never create the mirror row - the same rule the
-        # sibling GET route follows (api_node_iface_endpoint_default_get):
-        # look it up read-only and do not fail just because the node is down.
+
         iface = InterfaceConfig.query.filter_by(name=f'n{nid}:{name}').first()
 
         if iface is None:
@@ -14543,7 +17144,7 @@ def api_node_iface_endpoint_default_apply(nid, name):
 
 
 @app.post('/api/iface/<int:iid>/<action>')
-@login_required
+@require_api_key_or_login
 def iface_updown(iid, action):
     iface = (
         db.session.get(
@@ -14919,9 +17520,6 @@ def node_peers(nid):
                 'server_public_ip': node_pub_ip,
                 'address': p.address,
                 'endpoint': resolve_client_endpoint_cheap(p_iface, explicit=p.endpoint),
-                # The resolved value above is for display. Editors must round-trip
-                # the stored column instead, or saving an unrelated field would
-                # freeze a derived endpoint onto the peer.
                 'endpoint_saved': p.endpoint or '',
                 'peer_endpoint': getattr(p, 'peer_endpoint', None) or '',
                 'allowed_ips': p.allowed_ips or '',
@@ -15010,8 +17608,7 @@ def node_peers(nid):
         db.session.rollback()
         return address_error_response(exc)
     except NodePeerInstallError as exc:
-        # The request may have reached the node before a timeout/proxy failure.
-        # Delete by the newly generated key; the node endpoint is convergent.
+
         try:
             _rollback_node_created_peer(n, pub)
         except Exception:
@@ -15062,7 +17659,6 @@ def node_peers(nid):
     )
 
 
-##############################################
 @app.delete('/api/peer/<int:pid>/logs')
 @login_required
 def clear_peer_logs(pid):
@@ -15341,10 +17937,7 @@ def node_enable_peer(nid, pub):
 
 
 def _node_peer_live_total_bytes(node, peer):
-    """
-    Read current RX+TX from the node agent.
-    Returns bytes. Falls back to 0 if unavailable.
-    """
+
     try:
         iface_raw = peer.iface.name if peer.iface else ''
         iface_name = iface_raw.split(':', 1)[1] if ':' in iface_raw else iface_raw
@@ -15549,6 +18142,10 @@ def login():
                     'Invalid username or password'
                 ),
             )
+            _http_security_record_login_failure(
+                username=(username or 'unknown'),
+                failure_type='credentials',
+            )
 
             try:
                 client_ip, _ = (
@@ -15632,6 +18229,10 @@ def login():
                     reason=(
                         'Invalid TOTP or recovery code'
                     ),
+                )
+                _http_security_record_login_failure(
+                    username=account.username,
+                    failure_type='twofa',
                 )
 
                 try:
@@ -16107,9 +18708,6 @@ def users():
                 )
                 return render_template('users.html', form=form)
 
-        # The shortlink row is created here so it exists; its URL is rendered
-        # by the listing the redirect lands on, so the returned tuple is not
-        # captured (review finding #12 - confirmed unused, not a regression).
         try:
             _shortlink_for_peer(peer)
         except Exception:
@@ -16127,7 +18725,7 @@ def endpoint_presets():
         return jsonify(presets=_load_presets(), public_ipv4=_public_ipv4())
 
     if request.method == 'POST':
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         host = (data.get('host') or '').strip()
         port = int(data.get('port') or 0)
         label = (data.get('label') or '').strip() or f"{host}:{port}"
@@ -16143,7 +18741,7 @@ def endpoint_presets():
         _save_presets(presets)
         return jsonify(success=True, presets=presets)
 
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     host = (data.get('host') or '').strip()
     port = int(data.get('port') or 0)
     presets = [p for p in _load_presets() if not (p.get('host') == host and int(p.get('port') or 0) == port)]
@@ -16757,8 +19355,6 @@ def peers_create():
         n = Node.query.get_or_404(nid)
 
         name = (data.get('name') or '').strip() or 'peer'
-        # Explicit value only. An unset endpoint resolves through the interface
-        # override at export time; see `resolve_client_endpoint`.
         endpoint = (data.get('endpoint') or '').strip()
         allowed_ips = (data.get('allowed_ips') or '0.0.0.0/0, ::/0').strip()
         keepalive = _clean_keepalive(data.get('persistent_keepalive'))
@@ -16817,13 +19413,11 @@ def peers_create():
             node_ifaces = {}
             remote_iface = {}
 
-        # Make sure remote interface is up. it should making sure that it is up otherwise pass.
         try:
             node_post(n, f"/api/iface/{iface_name}/up", {})
         except Exception:
             pass
 
-        # Generate keys on panel, then install public key on node.
         try:
             priv = subprocess.check_output(
                 ['wg', 'genkey'],
@@ -16841,8 +19435,6 @@ def peers_create():
             current_app.logger.exception("key generation failed")
             return jsonify(error="key_generation_failed", detail=str(e)), 500
 
-        # The mirror row has to exist before allocation so a requested address
-        # can be validated against the node interface's real network.
         iface = ensure_node_mirror_iface(
             n, iface_name, remote_iface,
             mtu=mtu, dns=dns,
@@ -17022,7 +19614,12 @@ def peers_create():
     tg = (data.get('telegram_id') or data.get('telegram') or '').strip()
 
     allowed_ips = (data.get('allowed_ips') or '0.0.0.0/0, ::/0').strip()
-    endpoint = (data.get('endpoint') or '').strip()
+
+    try:
+        endpoint = parse_endpoint_string(data.get('endpoint'))
+    except EndpointValidationError as exc:
+        return jsonify(error=exc.code, detail=exc.detail, field='endpoint'), 400
+
     peer_endpoint = (data.get('peer_endpoint') or '').strip()
     keepalive = _clean_keepalive(data.get('persistent_keepalive'))
     mtu = _clean_mtu(data.get('mtu'))
@@ -17067,8 +19664,6 @@ def peers_create():
     short_url = None
     installed = False
 
-    # Allocate and install under one per-interface lock so two workers cannot
-    # claim the same host.
     with interface_allocation_lock(iface):
         try:
             peer.address = allocate_peer_address(iface, requested=data.get('address'))
@@ -17111,8 +19706,6 @@ def peers_create():
             current_app.logger.exception("local peer create failed: %s", e)
             return jsonify(error="local_create_failed", detail=str(e)), 500
 
-    # The shortlink is convenience data: it commits separately and its failure
-    # must not undo a peer that is already live.
     try:
         short_token, short_url = _shortlink_for_peer(peer)
     except Exception:
@@ -17338,9 +19931,6 @@ def panel_peers():
 
                 'address': peer.address,
                 'endpoint': resolve_client_endpoint_cheap(interface, explicit=peer.endpoint),
-                # The resolved value above is for display. Editors must round-trip
-                # the stored column instead, or saving an unrelated field would
-                # freeze a derived endpoint onto the peer.
                 'endpoint_saved': peer.endpoint or '',
                 'peer_endpoint': getattr(peer, 'peer_endpoint', None) or '',
                 'allowed_ips': peer.allowed_ips or '',
@@ -17541,7 +20131,6 @@ def panel_peers_bulk():
         })
 
         allowed_ips = (data.get('allowed_ips') or '0.0.0.0/0, ::/0').strip()
-        # Explicit value only; the interface override resolves at export time.
         endpoint = (data.get('endpoint') or '').strip()
 
         try:
@@ -17643,14 +20232,6 @@ def panel_peers_bulk():
         if not avail_ips:
             return jsonify(error="No available IPs for this node interface"), 409
 
-        # `avail_ips` is only a "the pool is not empty" probe. It is NOT a
-        # capacity limit: the agent bounds that list (MAX_AVAILABLE_IPS, 512)
-        # and allocates each address itself under its own lock, since
-        # `node_install_peer` below is called without `requested_address`.
-        # Clamping `count` to len(avail_ips) would silently truncate any batch
-        # larger than the agent's preview window and report it as a full
-        # success. The loop instead stops on `address_pool_exhausted`, exactly
-        # like the local bulk path.
         requested_count = count
 
         try:
@@ -17715,8 +20296,7 @@ def panel_peers_bulk():
                     )
                 except NodePeerInstallError as e:
                     if e.code == 'address_pool_exhausted':
-                        # The pool ran out mid-batch: stop, keep what worked,
-                        # and tell the caller how many we actually got.
+
                         pool_exhausted = True
                         break
                     raise
@@ -17778,9 +20358,7 @@ def panel_peers_bulk():
                 created.append(peer)
 
             except requests.HTTPError as e:
-                # Now rare: node_install_peer wraps HTTP errors as
-                # NodePeerInstallError. Kept as a safety net for any direct
-                # node_* call that might raise HTTPError in future.
+
                 body = getattr(e.response, 'text', '') if getattr(e, 'response', None) else ''
                 current_app.logger.exception(
                     "node bulk create failed node_id=%s iface=%s index=%s",
@@ -17801,8 +20379,7 @@ def panel_peers_bulk():
                         pass
 
             except NodePeerInstallError as e:
-                # Surface the agent's structured error code + detail rather
-                # than the bare class name (review finding #15).
+
                 current_app.logger.exception(
                     "node bulk create failed node_id=%s iface=%s index=%s code=%s",
                     nid, iface_name, i, e.code
@@ -17967,7 +20544,6 @@ def panel_peers_bulk():
             peer = None
             installed = False
             try:
-                # Allocate one at a time so each peer sees the ones before it.
                 addr = allocate_peer_address(iface)
 
                 priv = subprocess.check_output(['wg', 'genkey']).strip().decode()
@@ -18014,7 +20590,6 @@ def panel_peers_bulk():
                 created.append(peer)
 
             except AddressPoolExhausted:
-                # The pool ran out mid-batch: stop, keep what already worked.
                 db.session.rollback()
                 pool_exhausted = True
                 break
@@ -18179,13 +20754,7 @@ def get_interfaces():
             'available_ips': _available_ips(i),
             'is_up': _iface_up(i.name),
         }
-        # Endpoint default, built WITHOUT a per-row `_endpoint_fallback`
-        # subprocess probe: this list is polled frequently by the UI, and a
-        # probe per interface per request would multiply subprocess fanout.
-        # Auto-detection still runs at export time via `resolve_client_endpoint`
-        # (see `resolve_client_endpoint_cheap`); the listing only needs the
-        # saved override and a source flag the UI can show. Built by hand for
-        # the same reason and with the same shape as the `node_ifaces` loop.
+
         override = iface_endpoint_override(i)
         row.update({
             'endpoint_host': (getattr(i, 'endpoint_host', None) or '').strip() or None,
@@ -18193,7 +20762,7 @@ def get_interfaces():
             'endpoint_override': override,
             'auto_endpoint': '',
             'effective_endpoint': override,
-            'endpoint_source': 'override' if override else 'auto',
+            'endpoint_source': 'override' if override else 'none',
         })
         out.append(row)
 
@@ -18213,37 +20782,111 @@ def _iface_down(name: str):
         )
 
 def _egress_interface() -> str:
+    """
+    Detect the server's real outbound IPv4 interface.
+
+    Avoid selecting WireGuard/tunnel/container interfaces as
+    the MASQUERADE egress device.
+    """
 
     try:
         output = subprocess.check_output(
             [
-                "ip",
-                "-4",
-                "route",
-                "get",
-                "1.1.1.1",
+                'ip',
+                '-4',
+                'route',
+                'get',
+                '1.1.1.1',
             ],
             stderr=subprocess.DEVNULL,
             timeout=4,
         ).decode(
-            "utf-8",
-            "replace",
+            'utf-8',
+            'replace',
         )
 
-        match = re.search(
-            r"\bdev\s+([A-Za-z0-9_.:-]+)",
+        matches = re.findall(
+            r'\bdev\s+([A-Za-z0-9_.:-]+)',
             output,
         )
 
-        if match:
-            return match.group(1).strip()
+        for candidate in matches:
+            candidate = (
+                candidate
+                or ''
+            ).strip()
+
+            if not candidate:
+                continue
+
+            if candidate == 'lo':
+                continue
+
+            if re.match(
+                r'^(wg|tun|tap|docker|br-|veth)',
+                candidate,
+                re.IGNORECASE,
+            ):
+                continue
+
+            return candidate
 
     except Exception:
         current_app.logger.exception(
-            "Could not detect the default IPv4 egress interface"
+            'Could not detect the default '
+            'IPv4 egress interface'
         )
 
-    return ""
+    # Fallback: inspect the IPv4 default route.
+    try:
+        output = subprocess.check_output(
+            [
+                'ip',
+                '-4',
+                'route',
+                'show',
+                'default',
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+        ).decode(
+            'utf-8',
+            'replace',
+        )
+
+        matches = re.findall(
+            r'\bdev\s+([A-Za-z0-9_.:-]+)',
+            output,
+        )
+
+        for candidate in matches:
+            candidate = (
+                candidate
+                or ''
+            ).strip()
+
+            if not candidate:
+                continue
+
+            if candidate == 'lo':
+                continue
+
+            if re.match(
+                r'^(wg|tun|tap|docker|br-|veth)',
+                candidate,
+                re.IGNORECASE,
+            ):
+                continue
+
+            return candidate
+
+    except Exception:
+        current_app.logger.exception(
+            'Could not detect IPv4 egress '
+            'from the default route'
+        )
+
+    return ''
 
 
 def _wireguard_network(address_field: str) -> str:
@@ -18276,18 +20919,22 @@ def _wg_firewall_rules(
     address_field: str,
 ) -> tuple[str, str]:
 
-    network = _wireguard_network(address_field)
+    network = _wireguard_network(
+        address_field
+    )
 
     if not network:
         raise ValueError(
-            "Automatic forwarding requires a private IPv4 WireGuard subnet."
+            "Automatic forwarding requires a private IPv4 "
+            "WireGuard subnet."
         )
 
     egress = _egress_interface()
 
     if not egress:
         raise ValueError(
-            "The server's default IPv4 network interface could not be detected."
+            "The default IPv4 network interface "
+            "could not be detected."
         )
 
     if not re.fullmatch(
@@ -18298,88 +20945,275 @@ def _wg_firewall_rules(
             "The detected outbound interface name is invalid."
         )
 
-    post_up = (
-        "sysctl -w net.ipv4.ip_forward=1 >/dev/null; "
-        "iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null "
-        "|| iptables -A FORWARD -i %i -j ACCEPT; "
-        "iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null "
-        "|| iptables -A FORWARD -o %i -j ACCEPT; "
-        f"iptables -t nat -C POSTROUTING -s {network} "
-        f"-o {egress} -j MASQUERADE 2>/dev/null "
-        f"|| iptables -t nat -A POSTROUTING -s {network} "
-        f"-o {egress} -j MASQUERADE"
-    )
+    post_up = "\n".join([
+        "sysctl -w net.ipv4.ip_forward=1",
+        "iptables -A FORWARD -i %i -j ACCEPT",
+        (
+            "iptables -A FORWARD -o %i "
+            "-m conntrack --ctstate "
+            "RELATED,ESTABLISHED -j ACCEPT"
+        ),
+        (
+            f"iptables -t nat -A POSTROUTING "
+            f"-s {network} "
+            f"-o {egress} "
+            "-j MASQUERADE"
+        ),
+    ])
 
-    post_down = (
-        "iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true; "
-        "iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true; "
-        f"iptables -t nat -D POSTROUTING -s {network} "
-        f"-o {egress} -j MASQUERADE 2>/dev/null || true"
-    )
+    post_down = "\n".join([
+        "iptables -D FORWARD -i %i -j ACCEPT",
+        (
+            "iptables -D FORWARD -o %i "
+            "-m conntrack --ctstate "
+            "RELATED,ESTABLISHED -j ACCEPT"
+        ),
+        (
+            f"iptables -t nat -D POSTROUTING "
+            f"-s {network} "
+            f"-o {egress} "
+            "-j MASQUERADE"
+        ),
+    ])
 
     return post_up, post_down
 
 @app.post("/api/interfaces")
 @login_required
 def create_local_interface():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
 
-    name = (data.get("name") or "").strip()
-    address = (data.get("address") or "").strip()
-    dns = (data.get("dns") or "").strip() or None
-    auto_up = bool(data.get("auto_up"))
+    if not isinstance(data, dict):
+        try:
+            raw = request.get_data(cache=True, as_text=True).strip()
+            data = json.loads(raw) if raw else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            data = None
+
+    if not isinstance(data, dict):
+        current_app.logger.warning(
+            "Invalid interface-create payload: "
+            "content_type=%r mimetype=%r body=%r",
+            request.content_type,
+            request.mimetype,
+            request.get_data(cache=True, as_text=True)[:500],
+        )
+
+        return jsonify(
+            ok=False,
+            error="invalid_payload",
+            detail="The request body must be a JSON object.",
+        ), 400
+
+    name = str(
+        data.get("name")
+        or data.get("iface")
+        or data.get("interface_name")
+        or ""
+    ).strip()
+
+    address = str(
+        data.get("address")
+        or ""
+    ).strip()
+
+    dns = str(
+        data.get("dns")
+        or ""
+    ).strip() or None
+
+    auto_up = bool(
+        data.get("auto_up", True)
+    )
+
     auto_firewall = bool(
-    data.get("auto_firewall", True)
+        data.get("auto_firewall", True)
+    )
+
+    if not name:
+        return jsonify(
+            ok=False,
+            error="interface_name_required",
+            detail="Interface name is required.",
+        ), 400
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,32}",
+        name,
+    ):
+        return jsonify(
+            ok=False,
+            error="invalid_name",
+            detail=(
+                f"Invalid interface name {name!r}. "
+                "Use 1-32 characters: letters, numbers, "
+                "underscore, dot, or dash."
+            ),
+        ), 400
+
+    if not address:
+        return jsonify(
+            ok=False,
+            error="address_required",
+            detail=(
+                "WireGuard interface address is required. "
+                "Example: 10.77.0.1/24"
+            ),
+        ), 400
+
+    address_parts = [
+        value.strip()
+        for value in re.split(r"[\s,]+", address)
+        if value.strip()
+    ]
+
+    if not address_parts:
+        return jsonify(
+            ok=False,
+            error="invalid_address",
+            detail="No valid WireGuard address was supplied.",
+        ), 400
+
+    parsed_addresses = []
+
+    for value in address_parts:
+        try:
+            parsed_addresses.append(
+                ipaddress.ip_interface(value)
+            )
+        except ValueError:
+            return jsonify(
+                ok=False,
+                error="invalid_address",
+                detail=(
+                    f"{value!r} is not a valid CIDR. "
+                    "Example: 10.77.0.1/24"
+                ),
+            ), 400
+
+    address = ", ".join(
+        str(value)
+        for value in parsed_addresses
     )
 
     try:
-        listen_port = int(data.get("listen_port") or 0)
-    except Exception:
-        return jsonify(error="invalid_listen_port"), 400
+        listen_port = int(
+            data.get("listen_port")
+        )
+    except (TypeError, ValueError):
+        return jsonify(
+            ok=False,
+            error="invalid_listen_port",
+            detail="Listen port must be a number between 1 and 65535.",
+        ), 400
 
-    mtu = data.get("mtu")
+    if not 1 <= listen_port <= 65535:
+        return jsonify(
+            ok=False,
+            error="invalid_listen_port",
+            detail="Listen port must be between 1 and 65535.",
+        ), 400
+
+    raw_mtu = data.get("mtu")
+
     try:
-        mtu = int(mtu) if str(mtu or "").strip() else None
-    except Exception:
-        return jsonify(error="invalid_mtu"), 400
+        mtu = (
+            int(raw_mtu)
+            if raw_mtu not in (None, "")
+            and str(raw_mtu).strip()
+            else None
+        )
+    except (TypeError, ValueError):
+        return jsonify(
+            ok=False,
+            error="invalid_mtu",
+            detail="MTU must be a number between 576 and 9000.",
+        ), 400
 
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", name):
-        return jsonify(error="invalid_name", detail="Use 1-32 characters: letters, numbers, underscore, dot, or dash."), 400
+    if mtu is not None and not 576 <= mtu <= 9000:
+        return jsonify(
+            ok=False,
+            error="invalid_mtu",
+            detail="MTU must be between 576 and 9000.",
+        ), 400
 
-    if not address:
-        return jsonify(error="address_required"), 400
+    existing = (
+        InterfaceConfig.query
+        .filter_by(name=name)
+        .first()
+    )
 
-    try:
-        ipaddress.ip_interface(address)
-    except Exception:
-        return jsonify(error="invalid_address", detail="Use CIDR format, for example 10.77.0.1/24."), 400
+    if existing:
+        return jsonify(
+            ok=False,
+            error="interface_exists",
+            detail=f"Interface {name} already exists in the panel.",
+        ), 409
 
-    if not (1 <= listen_port <= 65535):
-        return jsonify(error="invalid_listen_port", detail="Listen port must be between 1 and 65535."), 400
+    wg_dir = (
+        app.config.get("WG_CONF_PATH")
+        or "/etc/wireguard"
+    )
 
-    if mtu is not None and not (576 <= mtu <= 9000):
-        return jsonify(error="invalid_mtu", detail="MTU must be between 576 and 9000."), 400
-
-    if InterfaceConfig.query.filter_by(name=name).first():
-        return jsonify(error="interface_exists", detail=f"Interface {name} already exists."), 409
-
-    wg_dir = app.config.get("WG_CONF_PATH") or "/etc/wireguard"
     if os.path.isfile(wg_dir):
         wg_dir = os.path.dirname(wg_dir)
 
-    os.makedirs(wg_dir, exist_ok=True)
-    conf_path = os.path.join(wg_dir, f"{name}.conf")
+    try:
+        os.makedirs(
+            wg_dir,
+            exist_ok=True,
+        )
+    except Exception as exc:
+        return jsonify(
+            ok=False,
+            error="wireguard_directory_failed",
+            detail=str(exc),
+        ), 500
+
+    conf_path = os.path.join(
+        wg_dir,
+        f"{name}.conf",
+    )
 
     if os.path.exists(conf_path):
-        return jsonify(error="config_exists", detail=f"{conf_path} already exists."), 409
+        return jsonify(
+            ok=False,
+            error="config_exists",
+            detail=f"{conf_path} already exists.",
+        ), 409
+
+    if _iface_up(name):
+        return jsonify(
+            ok=False,
+            error="interface_exists_system",
+            detail=(
+                f"Interface {name} already exists "
+                "on the operating system."
+            ),
+        ), 409
 
     try:
-        private_key = subprocess.check_output(["wg", "genkey"], timeout=5).decode().strip()
-    except Exception as e:
-        return jsonify(error="wg_genkey_failed", detail=str(e)), 500
+        for iface in InterfaceConfig.query.all():
+            if (
+                int(iface.listen_port or 0)
+                == listen_port
+            ):
+                return jsonify(
+                    ok=False,
+                    error="listen_port_in_use",
+                    detail=(
+                        f"Listen port {listen_port} is already "
+                        f"used by {iface.name}."
+                    ),
+                ), 409
+    except Exception:
+        current_app.logger.exception(
+            "Could not validate existing interface ports"
+        )
 
     post_up = ""
     post_down = ""
+    egress_interface = ""
 
     if auto_firewall:
         try:
@@ -18387,12 +21221,54 @@ def create_local_interface():
                 name,
                 address,
             )
-        except ValueError as e:
+
+            egress_interface = _egress_interface()
+
+        except ValueError as exc:
             return jsonify(
-               error="firewall_detection_failed",
-               detail=str(e),
+                ok=False,
+                error="auto_firewall_failed",
+                detail=str(exc),
+                hint=(
+                    "Disable automatic firewall rules if you "
+                    "want to create the interface without "
+                    "PostUp/PostDown forwarding rules."
+                ),
             ), 400
 
+        except Exception as exc:
+            current_app.logger.exception(
+                "Automatic firewall generation failed for %s",
+                name,
+            )
+
+            return jsonify(
+                ok=False,
+                error="auto_firewall_failed",
+                detail=str(exc),
+            ), 500
+
+    try:
+        private_key = (
+            subprocess.check_output(
+                ["wg", "genkey"],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            .decode()
+            .strip()
+        )
+
+    except Exception as exc:
+        current_app.logger.exception(
+            "wg genkey failed"
+        )
+
+        return jsonify(
+            ok=False,
+            error="wg_genkey_failed",
+            detail=str(exc),
+        ), 500
 
     lines = [
         "[Interface]",
@@ -18401,23 +21277,74 @@ def create_local_interface():
         f"ListenPort = {listen_port}",
     ]
 
-    if mtu:
-        lines.append(f"MTU = {mtu}")
+    if mtu is not None:
+        lines.append(
+            f"MTU = {mtu}"
+        )
 
-    if post_up:
-        lines.append(f"PostUp = {post_up}")
+    for command in str(
+        post_up or "").splitlines():
 
-    if post_down:
-        lines.append(f"PostDown = {post_down}")
+        command = command.strip()
 
-    conf_text = "\n".join(lines) + "\n"
+        if command:
+            lines.append(f"PostUp = {command}")
+
+
+    for command in str(
+        post_down or "").splitlines():
+
+        command = command.strip()
+
+        if command:
+            lines.append(f"PostDown = {command}")
+
+    lines.append("")
+
+    config_text = "\n".join(lines)
+
+    temp_path = (
+        conf_path
+        + ".tmp"
+    )
 
     try:
-        with open(conf_path, "w", encoding="utf-8") as f:
-            f.write(conf_text)
-        os.chmod(conf_path, 0o600)
-    except Exception as e:
-        return jsonify(error="write_config_failed", detail=str(e)), 500
+        with open(
+            temp_path,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(
+                config_text
+            )
+
+            handle.flush()
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.chmod(
+            temp_path,
+            0o600,
+        )
+
+        os.replace(
+            temp_path,
+            conf_path,
+        )
+
+    except Exception as exc:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+        return jsonify(
+            ok=False,
+            error="write_config_failed",
+            detail=str(exc),
+        ), 500
 
     iface = InterfaceConfig(
         name=name,
@@ -18431,20 +21358,79 @@ def create_local_interface():
         post_down=post_down or None,
     )
 
-    db.session.add(iface)
-    db.session.commit()
+    try:
+        db.session.add(iface)
+        db.session.commit()
+
+    except Exception as exc:
+        db.session.rollback()
+
+        try:
+            os.remove(conf_path)
+        except Exception:
+            pass
+
+        current_app.logger.exception(
+            "Could not save interface %s",
+            name,
+        )
+
+        return jsonify(
+            ok=False,
+            error="database_save_failed",
+            detail=str(exc),
+        ), 500
 
     up_error = None
+
     if auto_up:
         try:
-            _check_iface_up(iface)
-            subprocess.run(["systemctl","enable",f"wg-quick@{name}.service",],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10,check=False,)
+            proc = subprocess.run(
+                [
+                    "wg-quick",
+                    "up",
+                    name,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
 
-        except Exception as e:
-            up_error = str(e)
+            if proc.returncode != 0:
+                up_error = (
+                    proc.stderr
+                    or proc.stdout
+                    or f"wg-quick up {name} failed"
+                ).strip()
+
+            else:
+                try:
+                    subprocess.run(
+                        [
+                            "systemctl",
+                            "enable",
+                            f"wg-quick@{name}.service",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        check=False,
+                    )
+                except Exception:
+                    current_app.logger.warning(
+                        "Could not enable wg-quick@%s",
+                        name,
+                        exc_info=True,
+                    )
+
+        except Exception as exc:
+            up_error = str(exc)
 
     return jsonify(
         ok=True,
+
         interface={
             "id": iface.id,
             "name": iface.name,
@@ -18454,10 +21440,412 @@ def create_local_interface():
             "dns": iface.dns,
             "mtu": iface.mtu,
             "available_ips": _available_ips(iface),
-            "is_up": _iface_up(iface.name),
+            "is_up": _iface_up(name),
+            "post_up": post_up,
+            "post_down": post_down,
+            "auto_firewall": auto_firewall,
+            "egress_interface": egress_interface,
         },
+
         up_error=up_error,
     ), 201
+
+def _inject_firewall_rules(
+    config_path: str,
+    interface_name: str,
+    address_field: str,
+) -> dict:
+
+
+    if not os.path.isfile(config_path):
+        return {
+            "changed": False,
+            "reason": "config_missing",
+        }
+
+    try:
+        with open(
+            config_path,
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as handle:
+            original = handle.read()
+
+    except OSError as exc:
+        return {
+            "changed": False,
+            "reason": "read_failed",
+            "detail": str(exc),
+        }
+
+    in_interface = False
+    has_post_up = False
+    has_post_down = False
+
+    for raw_line in original.splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("[") and line.endswith("]"):
+            in_interface = (
+                line[1:-1].strip().lower()
+                == "interface"
+            )
+            continue
+
+        if not in_interface or "=" not in line:
+            continue
+
+        key = (
+            line.split("=", 1)[0]
+            .strip()
+            .lower()
+        )
+
+        if key == "postup":
+            has_post_up = True
+
+        elif key == "postdown":
+            has_post_down = True
+
+    if has_post_up or has_post_down:
+        return {
+            "changed": False,
+            "reason": "custom_rules_present",
+            "has_post_up": has_post_up,
+            "has_post_down": has_post_down,
+        }
+
+    try:
+        post_up, post_down = _wg_firewall_rules(
+            interface_name,
+            address_field,
+        )
+
+    except ValueError as exc:
+        return {
+            "changed": False,
+            "reason": "rule_generation_failed",
+            "detail": str(exc),
+        }
+
+    lines = original.splitlines()
+
+    insert_at = None
+    inside_interface = False
+    found_interface = False
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+
+        if not (
+            line.startswith("[")
+            and line.endswith("]")
+        ):
+            continue
+
+        section = (
+            line[1:-1]
+            .strip()
+            .lower()
+        )
+
+        if section == "interface":
+            inside_interface = True
+            found_interface = True
+            continue
+
+        if inside_interface:
+            insert_at = index
+            break
+
+    if not found_interface:
+        return {
+            "changed": False,
+            "reason": "interface_section_missing",
+        }
+
+    if insert_at is None:
+        insert_at = len(lines)
+
+    additions = [
+    *[
+        f"PostUp = {command.strip()}"
+        for command
+        in str(
+            post_up or ""
+        ).splitlines()
+        if command.strip()
+    ],
+
+    *[
+        f"PostDown = {command.strip()}"
+        for command
+        in str(
+            post_down or ""
+        ).splitlines()
+        if command.strip()
+    ],
+
+    "",
+    ]
+
+    new_lines = (
+        lines[:insert_at]
+        + additions
+        + lines[insert_at:]
+    )
+
+    updated = (
+        "\n".join(new_lines)
+        .rstrip()
+        + "\n"
+    )
+
+    directory = (
+        os.path.dirname(config_path)
+        or "."
+    )
+
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".wg-panel-firewall.",
+        dir=directory,
+    )
+
+    try:
+        try:
+            original_mode = (
+                os.stat(config_path).st_mode
+                & 0o777
+            )
+        except OSError:
+            original_mode = 0o600
+
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.chmod(
+            temporary_path,
+            original_mode,
+        )
+
+        os.replace(
+            temporary_path,
+            config_path,
+        )
+
+        temporary_path = ""
+
+    finally:
+        if (
+            temporary_path
+            and os.path.exists(temporary_path)
+        ):
+            try:
+                os.unlink(
+                    temporary_path
+                )
+            except OSError:
+                pass
+
+    runtime_applied = False
+    runtime_error = ""
+
+    if _iface_up(interface_name):
+        runtime_applied = False
+        runtime_error = ""
+
+    if _iface_up(
+        interface_name
+    ):
+        try:
+            errors = []
+
+            for raw_command in str(
+                post_up or "").splitlines():
+
+                raw_command = (raw_command.strip())
+
+                if not raw_command:
+                    continue
+
+                command = (
+                    raw_command.replace(
+                        "%i",
+                        shlex.quote(
+                            interface_name
+                        ),
+                    )
+                )
+
+                result = subprocess.run(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        command,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                ) 
+
+                if result.returncode != 0:
+                    errors.append(
+                        (
+                            result.stdout
+                            or command
+                        ).strip()
+                    )
+
+            runtime_applied = (
+                len(errors) == 0
+            )
+
+            if errors:
+                runtime_error = (
+                    "\n".join(
+                        errors
+                    )[-2000:]
+                )
+
+        except Exception as exc:
+            runtime_error = str(
+                exc
+            )
+
+        try:
+            result = subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    command,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+
+            runtime_applied = (
+                result.returncode == 0
+            )
+
+            if result.returncode != 0:
+                runtime_error = (
+                    result.stdout
+                    or ""
+                ).strip()[-2000:]
+
+        except Exception as exc:
+            runtime_error = str(exc)
+
+    return {
+        "changed": True,
+        "reason": "managed_rules_added",
+        "post_up": post_up,
+        "post_down": post_down,
+        "runtime_applied": runtime_applied,
+        "runtime_error": runtime_error,
+    }
+
+
+def local_firewall_rules() -> dict:
+    """
+    upgrade old local Wg configs postup/down
+
+    """
+    configured_path = (
+        app.config.get("WG_CONF_PATH")
+        or app.config.get(
+            "WIREGUARD_CONF_PATH"
+        )
+        or "/etc/wireguard"
+    )
+
+    if os.path.isdir(configured_path):
+        paths = sorted(
+            glob.glob(
+                os.path.join(
+                    configured_path,
+                    "*.conf",
+                )
+            )
+        )
+    elif os.path.isfile(configured_path):
+        paths = [configured_path]
+    else:
+        paths = []
+
+    summary = {
+        "checked": 0,
+        "updated": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+    for config_path in paths:
+        parsed = find_iface(config_path)
+
+        if not parsed:
+            summary["skipped"] += 1
+            continue
+
+        summary["checked"] += 1
+
+        result = _inject_firewall_rules(
+            config_path,
+            parsed.name,
+            parsed.address,
+        )
+
+        if result.get("changed"):
+            summary["updated"] += 1
+
+            app.logger.info(
+                "Added automatic firewall rules to "
+                "legacy interface %s; runtime_applied=%s",
+                parsed.name,
+                result.get("runtime_applied"),
+            )
+
+            if result.get("runtime_error"):
+                app.logger.warning(
+                    "Legacy interface %s was updated, "
+                    "but its runtime firewall rules "
+                    "could not be applied immediately: %s",
+                    parsed.name,
+                    result["runtime_error"],
+                )
+
+        elif result.get("reason") in {
+            "custom_rules_present",
+            "config_missing",
+        }:
+            summary["skipped"] += 1
+
+        else:
+            summary["failed"] += 1
+
+            app.logger.warning(
+                "Could not add firewall rules to "
+                "legacy interface %s: %s",
+                parsed.name,
+                result,
+            )
+
+    return summary
 
 @app.route('/api/iface/<int:iface_id>/enable', methods=['POST'])
 @csrf.exempt
@@ -18539,12 +21927,6 @@ def iface_delete(iface_id):
         except Exception:
             current_app.logger.exception("Failed to bring interface down before delete: %s", dev)
 
-        # `_iface_down` swallows its own failures (it falls back to `ip link
-        # del` with check=False), so it cannot be trusted to report that the
-        # device is gone. Verify, because deleting the rows below is what
-        # removes the operator's last handle on these peers: if the device is
-        # still up, every peer stays live in the kernel with nothing left to
-        # manage it.
         if _iface_up(dev):
             current_app.logger.warning(
                 "%s is still up after bringing it down; removing its peers individually",
@@ -18577,9 +21959,6 @@ def iface_delete(iface_id):
 
         deleted_peers = 0
         if delete_peers:
-            # The interface is verified down and its config file is removed
-            # below, so every peer's runtime and durable state goes with the
-            # interface.
             for peer in peers:
                 SubscriptionPeer.query.filter_by(peer_id=peer.id).delete(
                     synchronize_session=False
@@ -19113,82 +22492,449 @@ def api_disable(pid):
 @csrf.exempt
 @require_api_key_or_login
 def api_edit(pid):
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
+
+    if not isinstance(data, dict):
+        return jsonify(
+            success=False,
+            ok=False,
+            error='invalid_payload',
+            detail='The request body must be a JSON object.',
+        ), 400
+
     p = db.session.get(Peer, pid) or abort(404)
 
-    if 'time_limit_days' in data or 'time_limit_hours' in data:
-        data['time_limit_days'] = _conv_time_limit(data)
-        data.pop('time_limit_hours', None)
+    original = {
+        'name': p.name,
+        'address': p.address,
+        'allowed_ips': p.allowed_ips,
+        'endpoint': p.endpoint,
+        'peer_endpoint': p.peer_endpoint,
+        'persistent_keepalive': p.persistent_keepalive,
+        'mtu': p.mtu,
+        'dns': p.dns,
+        'data_limit_value': p.data_limit_value,
+        'data_limit_unit': p.data_limit_unit,
+        'time_limit_days': p.time_limit_days,
+        'start_on_first_use': p.start_on_first_use,
+        'unlimited': p.unlimited,
+        'phone_number': p.phone_number,
+        'telegram_id': p.telegram_id,
+    }
 
-    if 'address' in data:
-        # Re-addressing a peer must go through the same validation as creating one.
-        #
-        # An empty value is rejected rather than passed through: on create,
-        # `allocate_peer_address` reads a blank `requested` as "pick any free
-        # host", which on edit would silently move an existing peer to an
-        # arbitrary address and reinstall it, breaking every config already
-        # handed out for it. Omit the field to leave the address alone.
-        if not str(data.get('address') or '').strip():
+
+    if (
+        'time_limit_days' in data
+        or 'time_limit_hours' in data
+    ):
+        data['time_limit_days'] = _conv_time_limit(
+            data
+        )
+
+        data.pop(
+            'time_limit_hours',
+            None,
+        )
+
+    for field in (
+        'name',
+        'allowed_ips',
+        'endpoint',
+        'peer_endpoint',
+        'dns',
+        'phone_number',
+        'telegram_id',
+    ):
+        if field in data:
+            value = data.get(field)
+
+            data[field] = (
+                str(value).strip()
+                if value is not None
+                else ''
+            )
+
+    if 'endpoint' in data:
+        try:
+            data['endpoint'] = parse_endpoint_string(
+                data['endpoint']
+            )
+
+        except EndpointValidationError as exc:
             return jsonify(
-                error='invalid_address',
-                detail='address may not be empty; omit the field to leave it unchanged.',
+                success=False,
+                ok=False,
+                error=exc.code,
+                detail=exc.detail,
+                field='endpoint',
             ), 400
 
-        try:
-            data['address'] = allocate_peer_address(
-                p.iface,
-                requested=data['address'],
-                exclude_peer_id=p.id,
-                exclude_address=p.address,
-            )
-        except AddressAllocationError as e:
-            return address_error_response(e)
+    for field in (
+        'persistent_keepalive',
+        'mtu',
+    ):
+        if field in data:
+            raw = data.get(field)
 
-    updated = []
-    for f in ('name','address','allowed_ips','endpoint','peer_endpoint','persistent_keepalive','mtu','dns',
-              'data_limit_value','data_limit_unit','time_limit_days','start_on_first_use','unlimited',
-              'phone_number','telegram_id'):
-        if f in data:
-            setattr(p, f, data[f]); updated.append(f)
+            if raw in (
+                '',
+                None,
+            ):
+                data[field] = None
 
-    if any(k in data for k in ('time_limit_days', 'start_on_first_use', 'unlimited')):
-        if getattr(p, 'unlimited', False):
-            p.expires_at = None
-        elif getattr(p, 'time_limit_days', None):
-            if getattr(p, 'start_on_first_use', False) and not getattr(p, 'first_used_at', None):
-                p.expires_at = None
             else:
-                anchor_ts = to_ts(getattr(p, 'first_used_at', None)) or now_ts()
-                p.expires_at = from_ts(add_days_ts(anchor_ts, float(p.time_limit_days)))
+                try:
+                    data[field] = int(raw)
+
+                except Exception:
+                    return jsonify(
+                        success=False,
+                        ok=False,
+                        error='invalid_number',
+                        detail=(
+                            f'{field} must be a number.'
+                        ),
+                    ), 400
+
+    # Data limit
+    if 'data_limit_value' in data:
+        raw = data.get(
+            'data_limit_value'
+        )
+
+        try:
+            data[
+                'data_limit_value'
+            ] = (
+                int(float(raw))
+                if str(raw or '').strip()
+                else 0
+            )
+
+        except Exception:
+            return jsonify(
+                success=False,
+                ok=False,
+                error='invalid_data_limit',
+                detail='Traffic limit must be numeric.',
+            ), 400
+
+    for field in (
+        'start_on_first_use',
+        'unlimited',
+    ):
+        if field in data:
+            value = data.get(field)
+
+            if isinstance(
+                value,
+                bool,
+            ):
+                data[field] = value
+
+            else:
+                data[field] = (
+                    str(value)
+                    .strip()
+                    .lower()
+                    in (
+                        '1',
+                        'true',
+                        'yes',
+                        'on',
+                    )
+                )
+
+    if 'address' in data:
+        requested_address = str(
+            data.get('address')
+            or ''
+        ).strip()
+
+        if not requested_address:
+            return jsonify(
+                success=False,
+                ok=False,
+                error='invalid_address',
+                detail=(
+                    'address may not be empty; '
+                    'omit the field to leave it unchanged.'
+                ),
+            ), 400
+
+        if (
+            requested_address
+            != str(
+                original.get('address')
+                or ''
+            ).strip()
+        ):
+            try:
+                data['address'] = (
+                    allocate_peer_address(
+                        p.iface,
+                        requested=requested_address,
+                        exclude_peer_id=p.id,
+                        exclude_address=p.address,
+                    )
+                )
+
+            except AddressAllocationError as exc:
+                return address_error_response(
+                    exc
+                )
+
+        else:
+            data['address'] = (
+                original.get('address')
+            )
+
+    if 'peer_endpoint' in data:
+        submitted_peer_endpoint = str(
+            data.get('peer_endpoint')
+            or ''
+        ).strip()
+
+        original_peer_endpoint = str(
+            original.get('peer_endpoint')
+            or ''
+        ).strip()
+
+        if (
+            submitted_peer_endpoint
+            and submitted_peer_endpoint
+            != original_peer_endpoint
+        ):
+            try:
+                data['peer_endpoint'] = _wireguard_endpoint(
+                    submitted_peer_endpoint
+                )
+
+            except Exception as exc:
+                return jsonify(
+                success=False,
+                ok=False,
+                error='invalid_fixed_endpoint',
+                detail=str(exc),
+                field='peer_endpoint',
+            ), 400
+
+        else:
+            data['peer_endpoint'] = (
+            submitted_peer_endpoint
+            if submitted_peer_endpoint != original_peer_endpoint
+            else original_peer_endpoint
+        )
+
+    supported_fields = (
+        'name',
+        'address',
+        'allowed_ips',
+        'endpoint',
+        'peer_endpoint',
+        'persistent_keepalive',
+        'mtu',
+        'dns',
+        'data_limit_value',
+        'data_limit_unit',
+        'time_limit_days',
+        'start_on_first_use',
+        'unlimited',
+        'phone_number',
+        'telegram_id',
+    )
+
+    changed = []
+
+    for field in supported_fields:
+        if field not in data:
+            continue
+
+        new_value = data[field]
+        old_value = original.get(
+            field
+        )
+
+        if field in (
+            'endpoint',
+            'peer_endpoint',
+            'dns',
+            'phone_number',
+            'telegram_id',
+            'allowed_ips',
+            'name',
+        ):
+            old_cmp = str(
+                old_value or ''
+            ).strip()
+
+            new_cmp = str(
+                new_value or ''
+            ).strip()
+
+        elif field in (
+            'persistent_keepalive',
+            'mtu',
+        ):
+            old_cmp = (
+                int(old_value)
+                if old_value not in (
+                    None,
+                    '',
+                )
+                else None
+            )
+
+            new_cmp = (
+                int(new_value)
+                if new_value not in (
+                    None,
+                    '',
+                )
+                else None
+            )
+
+        else:
+            old_cmp = old_value
+            new_cmp = new_value
+
+        if old_cmp == new_cmp:
+            continue
+
+        setattr(
+            p,
+            field,
+            new_value,
+        )
+
+        changed.append(
+            field
+        )
+
+    if not changed:
+        return jsonify(
+            success=True,
+            ok=True,
+            changed=[],
+            message='No changes were necessary.',
+        ), 200
+
+    if any(
+        field in changed
+        for field in (
+            'time_limit_days',
+            'start_on_first_use',
+            'unlimited',
+        )
+    ):
+        if getattr(
+            p,
+            'unlimited',
+            False,
+        ):
+            p.expires_at = None
+
+        elif getattr(
+            p,
+            'time_limit_days',
+            None,
+        ):
+            if (
+                getattr(
+                    p,
+                    'start_on_first_use',
+                    False,
+                )
+                and not getattr(
+                    p,
+                    'first_used_at',
+                    None,
+                )
+            ):
+                p.expires_at = None
+
+            else:
+                anchor_ts = (
+                    to_ts(
+                        getattr(
+                            p,
+                            'first_used_at',
+                            None,
+                        )
+                    )
+                    or now_ts()
+                )
+
+                p.expires_at = from_ts(
+                    add_days_ts(
+                        anchor_ts,
+                        float(
+                            p.time_limit_days
+                        ),
+                    )
+                )
+
         else:
             p.expires_at = None
 
-    external_fields = {'address', 'peer_endpoint', 'persistent_keepalive'}
-    needs_external_apply = bool(external_fields.intersection(updated))
+    external_fields = {
+        'address',
+        'peer_endpoint',
+        'persistent_keepalive',
+    }
+
+    external_changed = bool(
+        external_fields.intersection(
+            changed
+        )
+    )
+
     external_attempted = False
+
     try:
-        # Flush first so uniqueness/type failures occur before touching
-        # WireGuard. Commit only after runtime and durable config both accept
-        # the candidate state.
         db.session.flush()
-        if needs_external_apply:
+
+        if external_changed:
             external_attempted = True
-            reapply_peer_external(p)
+
+            reapply_peer_external(
+                p
+            )
+
         db.session.commit()
+
     except Exception as exc:
         db.session.rollback()
-        current_app.logger.exception('Peer %s edit failed; restoring previous state', pid)
+
+        current_app.logger.exception(
+            'Peer %s edit failed; '
+            'restoring previous state',
+            pid,
+        )
 
         recovery_error = None
+
         if external_attempted:
-            previous = db.session.get(Peer, pid)
+            previous = db.session.get(
+                Peer,
+                pid,
+            )
+
             if previous is not None:
                 try:
-                    reapply_peer_external(previous)
+                    reapply_peer_external(
+                        previous
+                    )
+
                 except Exception as restore_exc:
-                    recovery_error = str(restore_exc)
+                    recovery_error = str(
+                        restore_exc
+                    )
+
                     current_app.logger.exception(
-                        'Could not restore peer %s after failed edit', pid
+                        'Could not restore peer %s '
+                        'after failed edit',
+                        pid,
                     )
 
         if recovery_error:
@@ -19202,28 +22948,119 @@ def api_edit(pid):
                 recoverable=True,
             ), 502
 
-        status = 409 if isinstance(exc, IntegrityError) else 502 if external_attempted else 500
+        if isinstance(
+            exc,
+            IntegrityError,
+        ):
+            status = 409
+
+        elif external_attempted:
+            status = 502
+
+        else:
+            status = 500
+
         return jsonify(
             success=False,
             ok=False,
-            error='peer_reapply_failed' if external_attempted else 'peer_edit_failed',
+            error=(
+                'peer_reapply_failed'
+                if external_attempted
+                else 'peer_edit_failed'
+            ),
             detail=str(exc),
             saved_fields=[],
             rolled_back=True,
         ), status
 
     try:
-        log_event(p, 'edited', f"Fields: {', '.join(updated)}")
-        logpanel_action("peer_edit", f"pid={p.id}; fields={', '.join(updated)}")
+        log_event(
+            p,
+            'edited',
+            (
+                'Fields: '
+                + ', '.join(
+                    changed
+                )
+            ),
+        )
+
+        logpanel_action(
+            'peer_edit',
+            (
+                f'pid={p.id}; fields='
+                + ', '.join(
+                    changed
+                )
+            ),
+        )
+
     except Exception:
-        db.session.rollback()
-        current_app.logger.warning('Peer %s was edited but audit logging failed', pid, exc_info=True)
+        current_app.logger.warning(
+            'Peer %s was edited but '
+            'audit logging failed',
+            pid,
+            exc_info=True,
+        )
 
-    return jsonify(success=True, ok=True)
+    return jsonify(
+        success=True,
+        ok=True,
+        changed=changed,
+        runtime_reapplied=(
+            external_changed
+        ),
+    )
 
+@app.route('/api/nodes/<int:nid>/peer/<path:pub>', methods=['PUT'])
+@csrf.exempt
+@require_api_key_or_login
+def api_edit_node_peer(nid, pub):
+    """
+    Edit a peer that belongs to a remote node.
+
+    """
+    Node.query.get_or_404(nid)
+
+    pub = (pub or '').strip()
+
+    if not pub:
+        return jsonify(
+            success=False,
+            ok=False,
+            error='peer_not_found',
+            detail='Peer public key is required.',
+        ), 404
+
+    p = (
+        db.session.query(Peer)
+        .join(
+            InterfaceConfig,
+            Peer.iface_id == InterfaceConfig.id,
+        )
+        .filter(Peer.public_key == pub)
+        .filter(
+            or_(
+                InterfaceConfig.name.like(f'n{nid}:%'),
+                InterfaceConfig.node_id == nid,
+            )
+        )
+        .first()
+    )
+
+    if p is None:
+        return jsonify(
+            success=False,
+            ok=False,
+            error='peer_not_found',
+            detail='No peer with that public key exists on this node.',
+        ), 404
+
+    return api_edit(p.id)
 
 @app.route('/api/peer/<int:pid>', methods=['DELETE'])
-@require_api_key
+@csrf.exempt
+@require_api_key_or_login
 def api_delete(pid):
     p = db.session.get(Peer, pid) or abort(404)
 
@@ -19231,38 +23068,304 @@ def api_delete(pid):
         remove_peer_everywhere(p)
     except PeerRemovalError as e:
         current_app.logger.error(
-            "peer delete failed at %s stage for pid=%s: %s", e.phase, pid, e
+            "peer delete failed at %s stage for pid=%s: %s",
+            e.phase,
+            pid,
+            e,
         )
-        return peer_removal_response(e, peer_id=pid)
+        return peer_removal_response(
+            e,
+            peer_id=pid,
+        )
 
-    logpanel_action("peer_delete", f"pid={pid}")
-    return jsonify(success=True, ok=True)
+    logpanel_action(
+        "peer_delete",
+        f"pid={pid}",
+    )
 
+    return jsonify(
+        success=True,
+        ok=True,
+    )
 
 @app.route('/api/peer/<int:pid>/logs')
 @login_required
 def peer_logs(pid):
     p = db.session.get(Peer, pid) or abort(404)
-    rows = (PeerEvent.query
+
+    rows = (
+        PeerEvent.query
         .filter_by(peer_id=pid)
         .order_by(PeerEvent.timestamp.desc())
         .limit(500)
-        .all())
+        .all()
+    )
 
-    return jsonify(logs=[{'time': isoz(e.timestamp), 'event': e.event, 'details': e.details}
-                     for e in rows])
+    def event_level(event_name):
+        name = str(event_name or '').strip().lower()
+
+        if any(word in name for word in (
+            'error',
+            'failed',
+            'failure',
+        )):
+            return 'error'
+
+        if any(word in name for word in (
+            'blocked',
+            'expired',
+            'limit',
+            'disabled',
+            'warning',
+        )):
+            return 'warning'
+
+        return 'info'
+
+    logs = []
+
+    for event in rows:
+        timestamp = isoz(
+            getattr(
+                event,
+                'timestamp',
+                None,
+            )
+        )
+
+        event_name = str(
+            getattr(
+                event,
+                'event',
+                '',
+            )
+            or ''
+        ).strip()
+
+        details = str(
+            getattr(
+                event,
+                'details',
+                '',
+            )
+            or ''
+        ).strip()
+
+        logs.append({
+            'time': timestamp,
+            'ts': timestamp,
+            'timestamp': timestamp,
+
+            'event': event_name,
+            'details': details,
+
+            'level': event_level(
+                event_name
+            ),
+
+            'text': (
+                details
+                or event_name
+                or 'Peer event'
+            ),
+        })
+
+    try:
+        runtime = _subscription_peer_runtime(
+            p
+        )
+    except Exception:
+        current_app.logger.debug(
+            'Could not load live runtime for peer log pid=%s',
+            pid,
+            exc_info=True,
+        )
+
+        runtime = {
+            'connected': False,
+            'conn_status': 'offline',
+            'connection_status': 'disconnected',
+            'connection_label': 'Disconnected',
+            'latest_handshake': 0,
+            'latest_handshake_age': None,
+            'last_activity_at': None,
+            'runtime_available': False,
+        }
+
+    iface = getattr(
+        p,
+        'iface',
+        None,
+    )
+
+    iface_raw = str(
+        getattr(
+            iface,
+            'name',
+            '',
+        )
+        or ''
+    ).strip()
+
+    node = (
+        getattr(
+            iface,
+            'node',
+            None,
+        )
+        if iface
+        else None
+    )
+
+    is_node = bool(
+        iface
+        and (
+            getattr(
+                iface,
+                'node_id',
+                None,
+            )
+            is not None
+            or re.match(
+                r'^n\d+:',
+                iface_raw,
+            )
+        )
+    )
+
+    interface_name = (
+        iface_raw.split(
+            ':',
+            1,
+        )[1]
+        if (
+            is_node
+            and ':' in iface_raw
+        )
+        else iface_raw
+    )
+
+    return jsonify(
+        ok=True,
+
+        peer={
+            'id': p.id,
+            'name': p.name or '',
+            'panel_status': (
+                p.status
+                or 'offline'
+            ),
+
+            'scope': (
+                'node'
+                if is_node
+                else 'local'
+            ),
+
+            'node_id': (
+                getattr(
+                    iface,
+                    'node_id',
+                    None,
+                )
+                if iface
+                else None
+            ),
+
+            'node_name': (
+                getattr(
+                    node,
+                    'name',
+                    '',
+                )
+                or ''
+            ),
+
+            'iface': interface_name,
+
+            'connected': bool(
+                runtime.get(
+                    'connected'
+                )
+            ),
+
+            'connection_label': (
+                runtime.get(
+                    'connection_label'
+                )
+                or 'Disconnected'
+            ),
+
+            'latest_handshake': int(
+                runtime.get(
+                    'latest_handshake'
+                )
+                or 0
+            ),
+
+            'latest_handshake_age': (
+                runtime.get(
+                    'latest_handshake_age'
+                )
+            ),
+
+            'last_activity_at': (
+                runtime.get(
+                    'last_activity_at'
+                )
+            ),
+        },
+
+        runtime=runtime,
+
+        logs=logs,
+    )
+
+SUBSCRIPTION_SETTINGS_FILE = os.path.join(
+    app.instance_path,
+    'subscription_settings.json',
+)
+
+SUBSCRIPTION_PORTAL_OVERRIDES_FILE = os.path.join(
+    app.instance_path,
+    'subscription_portal_overrides.json',
+)
 
 
-# Subscriptions: one client policy shared across local/node peers
-# =========================================================
-SUBSCRIPTION_SETTINGS_FILE = os.path.join(app.instance_path, 'subscription_settings.json')
+SUBSCRIPTION_LAYOUTS = {
+    'ps5',
+    'mac',
+    'app',
+    'compact',
+    'minimal',
+    'showcase',
+}
+
+SUBSCRIPTION_LAYOUT_ALIASES = {
+    'aurora': 'ps5',
+    'cards': 'mac',
+    'console': 'app',
+    'split': 'showcase',
+    'profile': 'showcase',
+    'executive': 'mac',
+    'flow': 'minimal',
+}
+
 
 def _sub_bool(v):
     if isinstance(v, bool):
         return v
+
     if v is None:
         return False
-    return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    return str(v).strip().lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
+    }
+
 
 def _sub_float(v, default=0.0):
     try:
@@ -19270,33 +23373,185 @@ def _sub_float(v, default=0.0):
     except Exception:
         return float(default)
 
+
 def _sub_int(v, default=0):
     try:
         return int(float(v or default))
     except Exception:
         return int(default)
 
+
 def _subscription_settings_default():
     return {
-        'layout': 'aurora',
-        'display_mode': 'hybrid',  # bars | rings | hybrid
-        'animation': 'rich',       # rich | soft | minimal
 
-        # Public page
+        'layout': 'ps5',
+
+        'hero_style': 'banner',
+        'page_width': 'wide',
+        'density': 'comfortable',
+
+        'config_style': 'cards',
+        'config_columns': 'two',
+        'section_order': 'usage_first',
+
+        'module_order': [
+            'configs',
+            'usage',
+            'install',
+            'support',
+        ],
+        'module_enabled': {
+            'configs': True,
+            'usage': True,
+            'install': True,
+            'support': True,
+        },
+
+        'module_sizes': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+        'module_mobile': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+        'module_surface': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+                'module_spacing': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+
+        'module_radius': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+
+        'module_heading': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+        'module_mobile_position': {
+            'configs': 'auto',
+            'usage': 'auto',
+            'install': 'auto',
+            'support': 'auto',
+        },
+
+        'module_gap': 'standard',
+
+        'background': 'orbits',
+        'accent': 'mint',
+
+        'primary_color': '#3addaa',
+        'secondary_color': '#63a5ff',
+
+        'online_color': '#22c55e',
+        'offline_color': '#94a3b8',
+        'warning_color': '#f59e0b',
+        'danger_color': '#ef4444',
+        'pill_color': '#64748b',
+        'action_color': '#3addaa',
+
+        'theme_default': 'auto',
+
+        'surface': 'glass',
+        'radius': 'rounded',
+        'shadow': 'deep',
+        'button_style': 'solid',
+        'font_scale': 'standard',
+
+        'background_intensity': 86,
+        'card_opacity': 82,
+
+        'display_mode': 'hybrid',
+        'stat_size': 'standard',
+
+        'show_percentage': True,
+        'show_used_detail': True,
+
+        'animation': 'cinematic',
+        'entrance_animation': 'stagger',
+        'hover_animation': 'lift',
+        'toast_style': 'pill',
+        'toast_position': 'bottom_center',
+        'toast_motion': 'slide',
+        'toast_duration': 2200,
+        'motion_speed': 125,
+        'motion_intensity': 150,
+        'particle_density': 90,
+
+        'show_quick_stats': True,
+        'show_install': True,
+        'show_support': True,
+        'show_live_badge': True,
+        'show_status_badge': True,
+
+        'show_location_country': True,
+        'show_download_action': True,
+        'show_copy_action': True,
+        'show_theme_action': True,
+        'show_section_descriptions': True,
+
+        'show_admin_notice': False,
+
+        'show_account_details': False,
+        'show_connection_overview': False,
+
+        'notice_title': 'Service notice',
+        'notice_text': '',
+
+        'notice_tone': 'info',
+        'notice_style': 'banner',
+        'notice_position': 'after_summary',
+
         'portal_label': 'Secure WireGuard portal',
         'portal_icon': 'fas fa-bolt',
-        'portal_title': '',
-        'portal_subtitle': 'Your Account is ready. Install Wireguard, then scan QR or import a config.',
 
-        # Optional support links
+        'portal_title': '',
+        'portal_subtitle': (
+            'Your account is ready. Install WireGuard, '
+            'then scan QR or import a config.'
+        ),
+
+        'title_align': 'left',
+        'logo_size': 'medium',
+
+        'usage_title': 'Usage overview',
+        'configs_title': 'Configs',
+        'install_title': 'Install WireGuard',
+        'support_title': 'Support',
+
+        'support_style': 'buttons',
+
         'support': {
             'telegram': '',
             'whatsapp': '',
             'phone': '',
             'email': '',
             'website': '',
-            'instagram': ''
-        }
+            'instagram': '',
+        },
     }
 
 
@@ -19324,154 +23579,1384 @@ def _subscription_portal_icons():
 
 
 def _subscription_portal_icon(value):
-    value = str(value or '').strip()
-    return value if value in _subscription_portal_icons() else 'fas fa-bolt'
+    value = str(
+        value or ''
+    ).strip()
+
+    return (
+        value
+        if value in _subscription_portal_icons()
+        else 'fas fa-bolt'
+    )
 
 
-def _subscription_text(value, default='', max_len=160):
-    value = str(value or '').strip()
+def _subscription_text(
+    value,
+    default='',
+    max_len=160,
+):
+    value = str(
+        value or ''
+    ).strip()
+
     if not value:
         return default
+
     return value[:max_len]
 
 
-def _load_subscription_settings():
-    os.makedirs(app.instance_path, exist_ok=True)
+def _subscription_choice(
+    value,
+    allowed,
+    default,
+):
+    value = str(
+        value or ''
+    ).strip().lower()
+
+    return (
+        value
+        if value in allowed
+        else default
+    )
+
+
+def _subscription_number(
+    value,
+    default,
+    minimum,
+    maximum,
+):
+    try:
+        number = int(
+            float(value)
+        )
+    except Exception:
+        number = int(default)
+
+    return max(
+        minimum,
+        min(
+            maximum,
+            number,
+        ),
+    )
+
+
+def _normalize_subscription_settings(
+    incoming=None,
+    *,
+    base=None,
+):
+    incoming = (
+        incoming
+        if isinstance(incoming, dict)
+        else {}
+    )
+
+    defaults = (
+        dict(base)
+        if isinstance(base, dict)
+        else _subscription_settings_default()
+    )
 
     d = _subscription_settings_default()
 
-    try:
-        with open(SUBSCRIPTION_SETTINGS_FILE, 'r', encoding='utf-8') as f:
-            got = json.load(f) or {}
+    for key, value in defaults.items():
+        if key == 'support':
+            continue
 
-        if not isinstance(got, dict):
-            got = {}
+        d[key] = value
 
-        layout = (got.get('layout') or got.get('selected') or d['layout']).strip().lower()
-        d['layout'] = layout if layout in ('aurora', 'compact', 'cards', 'minimal') else 'aurora'
-        display_mode = str(got.get('display_mode') or got.get('stats_style') or d.get('display_mode') or 'hybrid').strip().lower()
-        d['display_mode'] = display_mode if display_mode in ('bars', 'rings', 'hybrid') else 'hybrid'
+    d['support'] = dict(
+        defaults.get('support')
+        or d['support']
+    )
 
-        animation = str(got.get('animation') or got.get('motion') or d.get('animation') or 'rich').strip().lower()
-        d['animation'] = animation if animation in ('rich', 'soft', 'minimal') else 'rich'
 
-        support = got.get('support') if isinstance(got.get('support'), dict) else {}
-        identity = got.get('identity') if isinstance(got.get('identity'), dict) else {}
-        public = got.get('public') if isinstance(got.get('public'), dict) else {}
+    layout = str(
+        incoming.get('layout')
+        or incoming.get('selected')
+        or d['layout']
+    ).strip().lower()
 
-        def pick(*keys, default=''):
-            for src in (got, identity, public, support):
-                if not isinstance(src, dict):
-                    continue
-                for key in keys:
-                    if key in src and src.get(key) not in (None, ''):
-                        return src.get(key)
-            return default
 
-        d['portal_label'] = _subscription_text(
-            pick('portal_label', 'badge_label', 'label', default=d['portal_label']),
-            d['portal_label'],
-            80
+    layout = SUBSCRIPTION_LAYOUT_ALIASES.get(
+        layout,
+        layout,
+    )
+
+    d['layout'] = (
+        layout
+        if layout in SUBSCRIPTION_LAYOUTS
+        else 'ps5'
+    )
+
+    d['hero_style'] = _subscription_choice(
+        incoming.get(
+            'hero_style',
+            d['hero_style'],
+        ),
+        {
+            'panel',
+            'banner',
+            'minimal',
+        },
+        'panel',
+    )
+
+    d['page_width'] = _subscription_choice(
+        incoming.get(
+            'page_width',
+            d['page_width'],
+        ),
+        {
+            'narrow',
+            'standard',
+            'wide',
+        },
+        'standard',
+    )
+
+    d['density'] = _subscription_choice(
+        incoming.get(
+            'density',
+            d['density'],
+        ),
+        {
+            'comfortable',
+            'compact',
+        },
+        'comfortable',
+    )
+
+    d['config_style'] = _subscription_choice(
+        incoming.get(
+            'config_style',
+            d['config_style'],
+        ),
+        {
+            'cards',
+            'list',
+            'compact',
+        },
+        'cards',
+    )
+
+    d['config_columns'] = _subscription_choice(
+        incoming.get(
+            'config_columns',
+            d['config_columns'],
+        ),
+        {
+            'auto',
+            'one',
+            'two',
+        },
+        'auto',
+    )
+
+    d['section_order'] = _subscription_choice(
+        incoming.get(
+            'section_order',
+            d['section_order'],
+        ),
+        {
+            'standard',
+            'configs_first',
+            'usage_first',
+        },
+        'standard',
+    )
+
+    allowed_modules = (
+        'configs',
+        'usage',
+        'install',
+        'support',
+    )
+
+    default_module_order = [
+        'configs',
+        'usage',
+        'install',
+        'support',
+    ]
+
+    incoming_module_order = incoming.get(
+        'module_order',
+        d.get(
+            'module_order',
+            default_module_order,
+        ),
+    )
+
+    if not isinstance(
+        incoming_module_order,
+        (list, tuple),
+    ):
+        incoming_module_order = []
+
+    normalized_module_order = []
+
+    for module_name in incoming_module_order:
+        module_name = str(
+            module_name or ''
+        ).strip().lower()
+
+        if (
+            module_name in allowed_modules
+            and module_name
+            not in normalized_module_order
+        ):
+            normalized_module_order.append(
+                module_name
+            )
+
+    for module_name in default_module_order:
+        if (
+            module_name
+            not in normalized_module_order
+        ):
+            normalized_module_order.append(
+                module_name
+            )
+
+    d['module_order'] = (
+        normalized_module_order[:4]
+    )
+
+    module_keys = (
+        'configs',
+        'usage',
+        'install',
+        'support',
+    )
+
+    current_enabled = (
+        d.get('module_enabled')
+        if isinstance(
+            d.get('module_enabled'),
+            dict,
         )
-        d['portal_icon'] = _subscription_portal_icon(
-            pick('portal_icon', 'badge_icon', 'icon', default=d['portal_icon'])
+        else {}
+    )
+
+    incoming_enabled = (
+        incoming.get('module_enabled')
+        if isinstance(
+            incoming.get('module_enabled'),
+            dict,
         )
-        d['portal_title'] = _subscription_text(
-            pick('portal_title', 'title', default=d['portal_title']),
-            d['portal_title'],
-            90
+        else {}
+    )
+
+    normalized_enabled = {}
+
+    for module_name in module_keys:
+
+        if module_name in incoming_enabled:
+            value = incoming_enabled.get(
+                module_name
+            )
+        else:
+            value = current_enabled.get(
+                module_name,
+                True,
+            )
+
+        normalized_enabled[
+            module_name
+        ] = _sub_bool(
+            value
         )
-        d['portal_subtitle'] = _subscription_text(
-            pick('portal_subtitle', 'subtitle', default=d['portal_subtitle']),
-            d['portal_subtitle'],
-            180
+
+    if not any(
+        normalized_enabled.values()
+    ):
+        normalized_enabled[
+            'configs'
+        ] = True
+
+    d['module_enabled'] = (
+        normalized_enabled
+    )
+
+    allowed_module_sizes = {
+        'auto',
+        'small',
+        'medium',
+        'large',
+        'full',
+    }
+
+    current_sizes = (
+        d.get('module_sizes')
+        if isinstance(
+            d.get('module_sizes'),
+            dict,
+        )
+        else {}
+    )
+
+    incoming_sizes = (
+        incoming.get('module_sizes')
+        if isinstance(
+            incoming.get('module_sizes'),
+            dict,
+        )
+        else {}
+    )
+
+    normalized_sizes = {}
+
+    for module_name in module_keys:
+
+        value = str(
+            incoming_sizes.get(
+                module_name,
+                current_sizes.get(
+                    module_name,
+                    'auto',
+                ),
+            )
+            or 'auto'
+        ).strip().lower()
+
+        if value not in allowed_module_sizes:
+            value = 'auto'
+
+        normalized_sizes[
+            module_name
+        ] = value
+
+    d['module_sizes'] = (
+        normalized_sizes
+    )
+
+    allowed_mobile_sizes = {
+        'auto',
+        'half',
+        'full',
+    }
+
+    current_mobile = (
+        d.get('module_mobile')
+        if isinstance(
+            d.get('module_mobile'),
+            dict,
+        )
+        else {}
+    )
+
+    incoming_mobile = (
+        incoming.get('module_mobile')
+        if isinstance(
+            incoming.get('module_mobile'),
+            dict,
+        )
+        else {}
+    )
+
+    normalized_mobile = {}
+
+    for module_name in module_keys:
+
+        value = str(
+            incoming_mobile.get(
+                module_name,
+                current_mobile.get(
+                    module_name,
+                    'auto',
+                ),
+            )
+            or 'auto'
+        ).strip().lower()
+
+        if value not in allowed_mobile_sizes:
+            value = 'auto'
+
+        normalized_mobile[
+            module_name
+        ] = value
+
+    d['module_mobile'] = (
+        normalized_mobile
+    )
+
+    allowed_surfaces = {
+        'auto',
+        'panel',
+        'soft',
+        'outline',
+        'flat',
+        'accent',
+    }
+
+    current_surfaces = (
+        d.get('module_surface')
+        if isinstance(
+            d.get('module_surface'),
+            dict,
+        )
+        else {}
+    )
+
+    incoming_surfaces = (
+        incoming.get('module_surface')
+        if isinstance(
+            incoming.get('module_surface'),
+            dict,
+        )
+        else {}
+    )
+
+    normalized_surfaces = {}
+
+    for module_name in module_keys:
+
+        value = str(
+            incoming_surfaces.get(
+                module_name,
+                current_surfaces.get(
+                    module_name,
+                    'auto',
+                ),
+            )
+            or 'auto'
+        ).strip().lower()
+
+        if value not in allowed_surfaces:
+            value = 'auto'
+
+        normalized_surfaces[
+            module_name
+        ] = value
+
+    d['module_surface'] = (
+        normalized_surfaces
+    )
+
+    allowed_spacing = {
+        'auto',
+        'compact',
+        'comfortable',
+        'roomy',
+    }
+
+    current_spacing = (
+        d.get('module_spacing')
+        if isinstance(
+            d.get('module_spacing'),
+            dict,
+        )
+        else {}
+    )
+
+    incoming_spacing = (
+        incoming.get('module_spacing')
+        if isinstance(
+            incoming.get('module_spacing'),
+            dict,
+        )
+        else {}
+    )
+
+    normalized_spacing = {}
+
+    for module_name in module_keys:
+
+        value = str(
+            incoming_spacing.get(
+                module_name,
+                current_spacing.get(
+                    module_name,
+                    'auto',
+                ),
+            )
+            or 'auto'
+        ).strip().lower()
+
+        if value not in allowed_spacing:
+            value = 'auto'
+
+        normalized_spacing[
+            module_name
+        ] = value
+
+    d['module_spacing'] = (
+        normalized_spacing
+    )
+
+    def normalize_module_option_map(
+        setting_key,
+        allowed_values,
+        default_value='auto',
+        *,
+        unique_non_default=False,
+    ):
+        current_values = (
+            d.get(setting_key)
+            if isinstance(
+                d.get(setting_key),
+                dict,
+            )
+            else {}
         )
 
-        sup = d.get('support') or {}
-        incoming_support = got.get('support') if isinstance(got.get('support'), dict) else {}
-        incoming_socials = got.get('socials') if isinstance(got.get('socials'), dict) else {}
+        incoming_values = (
+            incoming.get(setting_key)
+            if isinstance(
+                incoming.get(setting_key),
+                dict,
+            )
+            else {}
+        )
 
-        for key in sup.keys():
-            sup[key] = str(
-                incoming_support.get(key)
-                if incoming_support.get(key) is not None
-                else incoming_socials.get(key, sup.get(key, ''))
-            ).strip()
+        normalized_values = {}
+        used_values = set()
 
-        d['support'] = sup
+        for module_name in module_keys:
 
-    except Exception:
-        pass
+            value = str(
+                incoming_values.get(
+                    module_name,
+                    current_values.get(
+                        module_name,
+                        default_value,
+                    ),
+                )
+                or default_value
+            ).strip().lower()
+
+            if value not in allowed_values:
+                value = default_value
+
+            if (
+                unique_non_default
+                and value != default_value
+            ):
+                if value in used_values:
+                    value = default_value
+                else:
+                    used_values.add(
+                        value
+                    )
+
+            normalized_values[
+                module_name
+            ] = value
+
+        return normalized_values
+
+
+    d['module_radius'] = (
+        normalize_module_option_map(
+            'module_radius',
+            {
+                'auto',
+                'square',
+                'soft',
+                'round',
+            },
+        )
+    )
+
+
+    d['module_heading'] = (
+        normalize_module_option_map(
+            'module_heading',
+            {
+                'auto',
+                'standard',
+                'compact',
+                'accent',
+                'hidden',
+            },
+        )
+    )
+
+    d['module_mobile_position'] = (
+        normalize_module_option_map(
+            'module_mobile_position',
+            {
+                'auto',
+                '1',
+                '2',
+                '3',
+                '4',
+            },
+            unique_non_default=True,
+        )
+    )
+
+    d['module_gap'] = _subscription_choice(
+        incoming.get(
+            'module_gap',
+            d.get(
+                'module_gap',
+                'auto',
+            ),
+        ),
+        {
+            'auto',
+            'tight',
+            'standard',
+            'roomy',
+        },
+        'auto',
+    )
+
+    d['background'] = _subscription_choice(
+        incoming.get(
+            'background',
+            d['background'],
+        ),
+        {
+            'aurora',
+            'waves',
+            'network',
+            'orbits',
+            'mesh',
+            'nebula',
+            'lines',
+            'constellation',
+            'prism',
+            'circuit',
+            'pulse',
+            'none',
+        },
+        'aurora',
+    )
+
+    d['accent'] = _subscription_choice(
+        incoming.get(
+            'accent',
+            d['accent'],
+        ),
+        {
+            'mint',
+            'blue',
+            'violet',
+            'coral',
+            'amber',
+            'mono',
+            'custom',
+        },
+        'mint',
+    )
+
+    d['theme_default'] = _subscription_choice(
+        incoming.get(
+            'theme_default',
+            d['theme_default'],
+        ),
+        {
+            'auto',
+            'light',
+            'dark',
+        },
+        'auto',
+    )
+
+    d['surface'] = _subscription_choice(
+        incoming.get(
+            'surface',
+            d['surface'],
+        ),
+        {
+            'glass',
+            'solid',
+            'soft',
+        },
+        'glass',
+    )
+
+    d['radius'] = _subscription_choice(
+        incoming.get(
+            'radius',
+            d['radius'],
+        ),
+        {
+            'rounded',
+            'medium',
+            'square',
+        },
+        'rounded',
+    )
+
+    d['shadow'] = _subscription_choice(
+        incoming.get(
+            'shadow',
+            d['shadow'],
+        ),
+        {
+            'none',
+            'soft',
+            'deep',
+        },
+        'soft',
+    )
+
+    d['button_style'] = _subscription_choice(
+        incoming.get(
+            'button_style',
+            d['button_style'],
+        ),
+        {
+            'solid',
+            'outline',
+            'soft',
+        },
+        'solid',
+    )
+
+    d['font_scale'] = _subscription_choice(
+        incoming.get(
+            'font_scale',
+            d['font_scale'],
+        ),
+        {
+            'small',
+            'standard',
+            'large',
+        },
+        'standard',
+    )
+
+    color_fields = (
+        ('primary_color', 'custom_primary', '#3addaa'),
+        ('secondary_color', 'custom_secondary', '#63a5ff'),
+        ('online_color', None, '#22c55e'),
+        ('offline_color', None, '#94a3b8'),
+        ('warning_color', None, '#f59e0b'),
+        ('danger_color', None, '#ef4444'),
+        ('pill_color', None, '#64748b'),
+        ('action_color', None, '#3addaa'),
+    )
+
+    for key, legacy_key, fallback in color_fields:
+        candidate = incoming.get(key)
+
+        if candidate in (None, '') and legacy_key:
+            candidate = incoming.get(legacy_key)
+
+        if candidate in (None, ''):
+            candidate = d.get(key) or fallback
+
+        value = str(candidate or '').strip()
+
+        if not re.fullmatch(r'#[0-9A-Fa-f]{6}', value):
+            value = fallback
+
+        d[key] = value.lower()
+
+    d['background_intensity'] = (
+        _subscription_number(
+            incoming.get(
+                'background_intensity',
+                d['background_intensity'],
+            ),
+            86,
+            0,
+            100,
+        )
+    )
+
+    d['card_opacity'] = (
+        _subscription_number(
+            incoming.get(
+                'card_opacity',
+                d['card_opacity'],
+            ),
+            82,
+            50,
+            100,
+        )
+    )
+
+    d['display_mode'] = _subscription_choice(
+        incoming.get(
+            'display_mode',
+            incoming.get(
+                'stats_style',
+                d['display_mode'],
+            ),
+        ),
+        {
+            'bars',
+            'rings',
+            'hybrid',
+            'focus',
+            'minimal',
+            'segments',
+        },
+        'hybrid',
+    )
+
+    d['stat_size'] = _subscription_choice(
+        incoming.get(
+            'stat_size',
+            d['stat_size'],
+        ),
+        {
+            'compact',
+            'standard',
+            'large',
+        },
+        'standard',
+    )
+
+    d['animation'] = _subscription_choice(
+        incoming.get(
+            'animation',
+            incoming.get(
+                'motion',
+                d['animation'],
+            ),
+        ),
+        {
+            'cinematic',
+            'immersive',
+            'rich',
+            'balanced',
+            'soft',
+            'drift',
+            'minimal',
+            'off',
+        },
+        'cinematic',
+    )
+
+    d['entrance_animation'] = _subscription_choice(
+        incoming.get(
+            'entrance_animation',
+            d['entrance_animation'],
+        ),
+        {'stagger', 'slide', 'fade', 'scale', 'none'},
+        'stagger',
+    )
+
+    d['hover_animation'] = _subscription_choice(
+        incoming.get(
+            'hover_animation',
+            d['hover_animation'],
+        ),
+        {'lift', 'glow', 'scale', 'none'},
+        'lift',
+    )
+
+    d['toast_style'] = _subscription_choice(
+        incoming.get('toast_style', d['toast_style']),
+        {'pill', 'card', 'glass', 'terminal', 'minimal'},
+        'pill',
+    )
+
+    d['toast_position'] = _subscription_choice(
+        incoming.get('toast_position', d['toast_position']),
+        {'bottom_center', 'bottom_right', 'top_right', 'top_center'},
+        'bottom_center',
+    )
+
+    d['toast_motion'] = _subscription_choice(
+        incoming.get('toast_motion', d['toast_motion']),
+        {'slide', 'pop', 'fade', 'bounce'},
+        'slide',
+    )
+
+    d['toast_duration'] = _subscription_number(
+        incoming.get('toast_duration', d['toast_duration']),
+        2200,
+        1200,
+        6000,
+    )
+
+    d['motion_speed'] = _subscription_number(
+        incoming.get('motion_speed', d['motion_speed']),
+        125,
+        50,
+        180,
+    )
+
+    d['motion_intensity'] = _subscription_number(
+        incoming.get('motion_intensity', d['motion_intensity']),
+        150,
+        40,
+        200,
+    )
+
+    d['particle_density'] = _subscription_number(
+        incoming.get('particle_density', d['particle_density']),
+        90,
+        0,
+        120,
+    )
+
+    for key in (
+        'show_percentage',
+        'show_used_detail',
+        'show_quick_stats',
+        'show_install',
+        'show_support',
+        'show_live_badge',
+        'show_status_badge',
+        'show_location_country',
+        'show_download_action',
+        'show_copy_action',
+        'show_theme_action',
+        'show_section_descriptions',
+        'show_admin_notice',
+        'show_account_details',
+        'show_connection_overview',
+    ):
+        if key in incoming:
+            d[key] = _sub_bool(
+                incoming.get(key)
+            )
+
+    identity = (
+        incoming.get('identity')
+        if isinstance(
+            incoming.get('identity'),
+            dict,
+        )
+        else {}
+    )
+
+    public = (
+        incoming.get('public')
+        if isinstance(
+            incoming.get('public'),
+            dict,
+        )
+        else {}
+    )
+
+    def pick(
+        *keys,
+        default=None,
+    ):
+        for source in (
+            incoming,
+            identity,
+            public,
+        ):
+            if not isinstance(
+                source,
+                dict,
+            ):
+                continue
+
+            for key in keys:
+                if key in source:
+                    return source.get(key)
+
+        return default
+
+    d['portal_label'] = _subscription_text(
+        pick(
+            'portal_label',
+            'badge_label',
+            'label',
+            default=d['portal_label'],
+        ),
+        d['portal_label'],
+        80,
+    )
+
+    d['portal_icon'] = (
+        _subscription_portal_icon(
+            pick(
+                'portal_icon',
+                'badge_icon',
+                'icon',
+                default=d['portal_icon'],
+            )
+        )
+    )
+
+    d['portal_title'] = _subscription_text(
+        pick(
+            'portal_title',
+            'title',
+            default=d['portal_title'],
+        ),
+        '',
+        90,
+    )
+
+    d['portal_subtitle'] = _subscription_text(
+        pick(
+            'portal_subtitle',
+            'subtitle',
+            default=d['portal_subtitle'],
+        ),
+        d['portal_subtitle'],
+        180,
+    )
+
+    d['title_align'] = _subscription_choice(
+        incoming.get(
+            'title_align',
+            d['title_align'],
+        ),
+        {
+            'left',
+            'center',
+        },
+        'left',
+    )
+
+    d['logo_size'] = _subscription_choice(
+        incoming.get(
+            'logo_size',
+            d['logo_size'],
+        ),
+        {
+            'small',
+            'medium',
+            'large',
+        },
+        'medium',
+    )
+
+    d['usage_title'] = _subscription_text(
+        incoming.get(
+            'usage_title',
+            d['usage_title'],
+        ),
+        'Usage overview',
+        80,
+    )
+
+    d['configs_title'] = _subscription_text(
+        incoming.get(
+            'configs_title',
+            d['configs_title'],
+        ),
+        'Configs',
+        80,
+    )
+
+    d['install_title'] = _subscription_text(
+        incoming.get(
+            'install_title',
+            d['install_title'],
+        ),
+        'Install WireGuard',
+        80,
+    )
+
+    d['support_title'] = _subscription_text(
+        incoming.get(
+            'support_title',
+            d['support_title'],
+        ),
+        'Support',
+        80,
+    )
+
+    d['notice_title'] = _subscription_text(
+        incoming.get(
+            'notice_title',
+            d.get(
+                'notice_title',
+                'Service notice',
+            ),
+        ),
+        'Service notice',
+        60,
+    )
+
+    d['notice_text'] = _subscription_text(
+        incoming.get(
+            'notice_text',
+            d.get(
+                'notice_text',
+                '',
+            ),
+        ),
+        '',
+        240,
+    )
+    d['notice_tone'] = _subscription_choice(
+        incoming.get(
+            'notice_tone',
+            d.get(
+                'notice_tone',
+                'info',
+            ),
+        ),
+        {
+            'info',
+            'maintenance',
+            'warning',
+            'success',
+            'neutral',
+        },
+        'info',
+    )
+
+    d['notice_style'] = _subscription_choice(
+        incoming.get(
+            'notice_style',
+            d.get(
+                'notice_style',
+                'banner',
+            ),
+        ),
+        {
+            'banner',
+            'card',
+            'strip',
+        },
+        'banner',
+    )
+
+    d['notice_position'] = _subscription_choice(
+        incoming.get(
+            'notice_position',
+            d.get(
+                'notice_position',
+                'after_summary',
+            ),
+        ),
+        {
+            'after_summary',
+            'before_modules',
+            'after_modules',
+        },
+        'after_summary',
+    )
+
+    d['support_style'] = _subscription_choice(
+        incoming.get(
+            'support_style',
+            d['support_style'],
+        ),
+        {
+            'buttons',
+            'list',
+            'compact',
+        },
+        'buttons',
+    )
+
+    support = (
+        incoming.get('support')
+        if isinstance(
+            incoming.get('support'),
+            dict,
+        )
+        else {}
+    )
+
+    socials = (
+        incoming.get('socials')
+        if isinstance(
+            incoming.get('socials'),
+            dict,
+        )
+        else {}
+    )
+
+    existing_support = (
+        d.get('support')
+        or {}
+    )
+
+    normalized_support = {}
+
+    for key in (
+        'telegram',
+        'whatsapp',
+        'phone',
+        'email',
+        'website',
+        'instagram',
+    ):
+        if key in support:
+            value = support.get(key)
+
+        elif key in socials:
+            value = socials.get(key)
+
+        else:
+            value = existing_support.get(
+                key,
+                '',
+            )
+
+        normalized_support[key] = str(
+            value or ''
+        ).strip()[:500]
+
+    d['support'] = normalized_support
 
     return d
 
 
+def _write_json_atomic(
+    path,
+    payload,
+):
+    os.makedirs(
+        os.path.dirname(path),
+        exist_ok=True,
+    )
+
+    temporary = (
+        path
+        + '.tmp'
+    )
+
+    with open(
+        temporary,
+        'w',
+        encoding='utf-8',
+    ) as handle:
+        json.dump(
+            payload,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    os.replace(
+        temporary,
+        path,
+    )
+
+
+def _load_subscription_settings():
+    os.makedirs(
+        app.instance_path,
+        exist_ok=True,
+    )
+
+    try:
+        with open(
+            SUBSCRIPTION_SETTINGS_FILE,
+            'r',
+            encoding='utf-8',
+        ) as handle:
+            payload = (
+                json.load(handle)
+                or {}
+            )
+
+    except Exception:
+        payload = {}
+
+    return _normalize_subscription_settings(
+        payload
+    )
+
+
 def _save_subscription_settings(data):
+    current = (
+        _load_subscription_settings()
+    )
+
+    saved = (
+        _normalize_subscription_settings(
+            data,
+            base=current,
+        )
+    )
+
+    _write_json_atomic(
+        SUBSCRIPTION_SETTINGS_FILE,
+        saved,
+    )
+
+    return saved
+
+
+def _load_subscription_portal_overrides():
+    try:
+        with open(
+            SUBSCRIPTION_PORTAL_OVERRIDES_FILE,
+            'r',
+            encoding='utf-8',
+        ) as handle:
+            payload = (
+                json.load(handle)
+                or {}
+            )
+
+        return (
+            payload
+            if isinstance(payload, dict)
+            else {}
+        )
+
+    except Exception:
+        return {}
+
+
+def _save_subscription_portal_overrides(
+    data,
+):
     if not isinstance(data, dict):
         data = {}
 
-    cur = _load_subscription_settings()
-
-    if 'layout' in data or 'selected' in data:
-        layout = str(data.get('layout') or data.get('selected') or cur.get('layout') or 'aurora').strip().lower()
-        cur['layout'] = layout if layout in ('aurora', 'compact', 'cards', 'minimal') else 'aurora'
-
-    if 'display_mode' in data or 'stats_style' in data:
-        display_mode = str(data.get('display_mode') or data.get('stats_style') or cur.get('display_mode') or 'hybrid').strip().lower()
-        cur['display_mode'] = display_mode if display_mode in ('bars', 'rings', 'hybrid') else 'hybrid'
-
-    if 'animation' in data or 'motion' in data:
-        animation = str(data.get('animation') or data.get('motion') or cur.get('animation') or 'rich').strip().lower()
-        cur['animation'] = animation if animation in ('rich', 'soft', 'minimal') else 'rich'
-
-    support = data.get('support') if isinstance(data.get('support'), dict) else {}
-    identity = data.get('identity') if isinstance(data.get('identity'), dict) else {}
-    public = data.get('public') if isinstance(data.get('public'), dict) else {}
-
-    def pick(*keys, default=None):
-        for src in (data, identity, public, support):
-            if not isinstance(src, dict):
-                continue
-            for key in keys:
-                if key in src:
-                    return src.get(key)
-        return default
-
-    portal_label = pick('portal_label', 'badge_label', 'label', default=cur.get('portal_label'))
-    portal_icon = pick('portal_icon', 'badge_icon', 'icon', default=cur.get('portal_icon'))
-    portal_title = pick('portal_title', 'title', default=cur.get('portal_title'))
-    portal_subtitle = pick('portal_subtitle', 'subtitle', default=cur.get('portal_subtitle'))
-
-    cur['portal_label'] = _subscription_text(
-        portal_label,
-        'Secure WireGuard portal',
-        80
-    )
-    cur['portal_icon'] = _subscription_portal_icon(portal_icon)
-    cur['portal_title'] = _subscription_text(
-        portal_title,
-        '',
-        90
-    )
-    cur['portal_subtitle'] = _subscription_text(
-        portal_subtitle,
-        'Your account is ready. Install WireGuard, then scan QR or import a config.',
-        180
+    _write_json_atomic(
+        SUBSCRIPTION_PORTAL_OVERRIDES_FILE,
+        data,
     )
 
-    if isinstance(data.get('support'), dict):
-        cur['support'].update({
-            k: str(data['support'].get(k) or '').strip()
-            for k in cur['support'].keys()
-        })
 
-    cur['support']['portal_label'] = cur['portal_label']
+def _subscription_portal_override(
+    sub,
+):
+    if not sub:
+        return {}
 
-    os.makedirs(app.instance_path, exist_ok=True)
-    with open(SUBSCRIPTION_SETTINGS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cur, f, indent=2)
+    store = (
+        _load_subscription_portal_overrides()
+    )
 
-    return cur
+    value = store.get(
+        str(
+            getattr(
+                sub,
+                'id',
+                '',
+            )
+        )
+    )
+
+    return (
+        value
+        if isinstance(value, dict)
+        else {}
+    )
+
+
+def _effective_subscription_settings(
+    sub=None,
+):
+    global_settings = (
+        _load_subscription_settings()
+    )
+
+    if sub is None:
+        return global_settings
+
+    override = (
+        _subscription_portal_override(
+            sub
+        )
+    )
+
+    if not override:
+        return global_settings
+
+    return _normalize_subscription_settings(
+        override,
+        base=global_settings,
+    )
 
 def _sub_limit_bytes(sub):
     try:
@@ -19651,6 +25136,657 @@ def _block_subscription_runtime(sub, reason='subscription_blocked'):
 
     return changed
 
+def _subscription_peer_runtime(peer):
+    """
+    Return actual WireGuard activity for one subscription peer.
+
+    This is intentionally separate from Peer.status:
+
+        Peer.status
+            = administrative state
+              online / offline / blocked
+
+        connected
+            = recent WireGuard handshake
+
+    Local peers are read directly from the local WireGuard runtime.
+
+    Node peers are read from the node agent's /api/peers endpoint.
+
+    Runtime data is cached on Flask ``g`` for the current HTTP request so:
+        - each local WireGuard interface is inspected once
+        - each remote node is contacted once
+    """
+
+    iface = getattr(
+        peer,
+        'iface',
+        None,
+    )
+
+    raw_iface_name = str(
+        getattr(
+            iface,
+            'name',
+            '',
+        )
+        or ''
+    ).strip()
+
+    public_key = str(
+        getattr(
+            peer,
+            'public_key',
+            '',
+        )
+        or ''
+    ).strip()
+
+    current_epoch = now_ts()
+
+    try:
+        handshake_window = max(
+            30,
+            int(
+                os.environ.get(
+                    'WG_SUBSCRIPTION_CONNECTED_WINDOW',
+                    '180',
+                )
+                or 180
+            ),
+        )
+
+    except Exception:
+        handshake_window = 180
+
+    result = {
+        'connected': False,
+
+        'conn_status': 'offline',
+
+        'connection_status': (
+            'disconnected'
+        ),
+
+        'connection_label': (
+            'Disconnected'
+        ),
+
+        'conn_reason': (
+            'no_recent_activity'
+        ),
+
+        'latest_handshake': 0,
+
+        'latest_handshake_age': None,
+
+        'last_activity_at': None,
+
+        'runtime_available': True,
+
+        'handshake_window': (
+            handshake_window
+        ),
+    }
+
+    if (
+        not iface
+        or not public_key
+    ):
+        result[
+            'runtime_available'
+        ] = False
+
+        result[
+            'conn_reason'
+        ] = 'peer_runtime_missing'
+
+        return result
+
+    node_id = getattr(
+        iface,
+        'node_id',
+        None,
+    )
+
+    legacy_node_match = (
+        re.match(
+            r'^n(\d+):(.+)$',
+            raw_iface_name,
+        )
+    )
+
+    if (
+        node_id is None
+        and legacy_node_match
+    ):
+        try:
+            node_id = int(
+                legacy_node_match.group(
+                    1
+                )
+            )
+        except Exception:
+            node_id = None
+
+    is_node = bool(
+        node_id is not None
+        or legacy_node_match
+    )
+
+    if is_node:
+        node = getattr(
+            iface,
+            'node',
+            None,
+        )
+
+        if (
+            node is None
+            and node_id is not None
+        ):
+            node = db.session.get(
+                Node,
+                int(node_id),
+            )
+
+        if node is None:
+            result[
+                'runtime_available'
+            ] = False
+
+            result[
+                'conn_reason'
+            ] = 'node_missing'
+
+            return result
+
+        cache = getattr(
+            g,
+            '_subscription_node_runtime_cache',
+            None,
+        )
+
+        if cache is None:
+            cache = {}
+
+            g._subscription_node_runtime_cache = (
+                cache
+            )
+
+        cache_key = int(
+            node.id
+        )
+
+        if cache_key not in cache:
+            try:
+                payload = (
+                    node_get(
+                        node,
+                        '/api/peers',
+                        timeout=8,
+                    )
+                    or {}
+                )
+
+                rows = (
+                    payload.get(
+                        'peers'
+                    )
+                    if isinstance(
+                        payload,
+                        dict,
+                    )
+                    else []
+                )
+
+                runtime_by_key = {}
+
+                for row in (
+                    rows or []
+                ):
+                    if not isinstance(
+                        row,
+                        dict,
+                    ):
+                        continue
+
+                    row_public_key = str(
+                        row.get(
+                            'public_key'
+                        )
+                        or row.get(
+                            'id'
+                        )
+                        or ''
+                    ).strip()
+
+                    if row_public_key:
+                        runtime_by_key[
+                            row_public_key
+                        ] = row
+
+                cache[
+                    cache_key
+                ] = {
+                    'ok': True,
+                    'rows': runtime_by_key,
+                }
+
+            except Exception as exc:
+                current_app.logger.debug(
+                    'Subscription runtime: node %s unavailable: %s',
+                    getattr(
+                        node,
+                        'id',
+                        '?',
+                    ),
+                    exc,
+                )
+
+                cache[
+                    cache_key
+                ] = {
+                    'ok': False,
+                    'rows': {},
+                }
+
+        node_cache = (
+            cache.get(
+                cache_key
+            )
+            or {}
+        )
+
+        if not node_cache.get(
+            'ok'
+        ):
+            result[
+                'runtime_available'
+            ] = False
+
+            result[
+                'conn_reason'
+            ] = 'node_unavailable'
+
+            return result
+
+        row = (
+            node_cache.get(
+                'rows'
+            )
+            or {}
+        ).get(
+            public_key
+        )
+
+        if not isinstance(
+            row,
+            dict,
+        ):
+            result[
+                'conn_reason'
+            ] = 'peer_not_in_runtime'
+
+            return result
+
+        try:
+            latest_handshake = max(
+                0,
+                int(
+                    row.get(
+                        'latest_handshake'
+                    )
+                    or 0
+                ),
+            )
+
+        except Exception:
+            latest_handshake = 0
+
+        try:
+            handshake_age = (
+                row.get(
+                    'latest_handshake_age'
+                )
+            )
+
+            if handshake_age is not None:
+                handshake_age = max(
+                    0,
+                    int(
+                        handshake_age
+                    ),
+                )
+
+            elif latest_handshake > 0:
+                handshake_age = max(
+                    0,
+                    current_epoch
+                    - latest_handshake,
+                )
+
+            else:
+                handshake_age = None
+
+        except Exception:
+            handshake_age = (
+                max(
+                    0,
+                    current_epoch
+                    - latest_handshake,
+                )
+                if latest_handshake > 0
+                else None
+            )
+
+        connected = bool(
+            latest_handshake > 0
+            and handshake_age is not None
+            and handshake_age
+            <= handshake_window
+        )
+
+        try:
+            rx_mib = float(
+                row.get(
+                    'rx_mib'
+                )
+                or 0
+            )
+
+        except Exception:
+            rx_mib = 0.0
+
+        try:
+            tx_mib = float(
+                row.get(
+                    'tx_mib'
+                )
+                or 0
+            )
+
+        except Exception:
+            tx_mib = 0.0
+
+        result.update({
+            'connected': connected,
+
+            'conn_status': (
+                'online'
+                if connected
+                else 'offline'
+            ),
+
+            'connection_status': (
+                'connected'
+                if connected
+                else 'disconnected'
+            ),
+
+            'connection_label': (
+                'Connected'
+                if connected
+                else 'Disconnected'
+            ),
+
+            'conn_reason': (
+                'handshake'
+                if connected
+                else (
+                    'stale_handshake'
+                    if latest_handshake > 0
+                    else 'no_handshake'
+                )
+            ),
+
+            'latest_handshake': (
+                latest_handshake
+            ),
+
+            'latest_handshake_age': (
+                handshake_age
+            ),
+
+            'last_activity_at': (
+                datetime.utcfromtimestamp(
+                    latest_handshake
+                ).isoformat()
+                + 'Z'
+                if latest_handshake > 0
+                else None
+            ),
+
+            'rx_bytes': int(
+                rx_mib
+                * 1024
+                * 1024
+            ),
+
+            'tx_bytes': int(
+                tx_mib
+                * 1024
+                * 1024
+            ),
+
+            'node_reported_conn_status': (
+                row.get(
+                    'conn_status'
+                )
+                or row.get(
+                    'connection_status'
+                )
+                or row.get(
+                    'status'
+                )
+                or ''
+            ),
+
+            'node_reported_conn_reason': (
+                row.get(
+                    'conn_reason'
+                )
+                or ''
+            ),
+        })
+
+        return result
+
+    interface_name = raw_iface_name
+
+    if not interface_name:
+        result[
+            'runtime_available'
+        ] = False
+
+        result[
+            'conn_reason'
+        ] = 'interface_missing'
+
+        return result
+
+    cache = getattr(
+        g,
+        '_subscription_local_runtime_cache',
+        None,
+    )
+
+    if cache is None:
+        cache = {}
+
+        g._subscription_local_runtime_cache = (
+            cache
+        )
+
+    if interface_name not in cache:
+        try:
+            transfers, handshakes = (
+                _wg_runtime_snapshot(
+                    [
+                        interface_name
+                    ]
+                )
+            )
+
+            cache[
+                interface_name
+            ] = {
+                'ok': True,
+                'transfers': transfers,
+                'handshakes': handshakes,
+            }
+
+        except Exception as exc:
+            current_app.logger.debug(
+                'Subscription runtime: local interface %s unavailable: %s',
+                interface_name,
+                exc,
+            )
+
+            cache[
+                interface_name
+            ] = {
+                'ok': False,
+                'transfers': {},
+                'handshakes': {},
+            }
+
+    local_cache = (
+        cache.get(
+            interface_name
+        )
+        or {}
+    )
+
+    if not local_cache.get(
+        'ok'
+    ):
+        result[
+            'runtime_available'
+        ] = False
+
+        result[
+            'conn_reason'
+        ] = 'wireguard_unavailable'
+
+        return result
+
+    transfers = (
+        local_cache.get(
+            'transfers'
+        )
+        or {}
+    )
+
+    handshakes = (
+        local_cache.get(
+            'handshakes'
+        )
+        or {}
+    )
+
+    latest_handshake = int(
+        handshakes.get(
+            (
+                interface_name,
+                public_key,
+            ),
+            0,
+        )
+        or 0
+    )
+
+    handshake_age = (
+        max(
+            0,
+            current_epoch
+            - latest_handshake,
+        )
+        if latest_handshake > 0
+        else None
+    )
+
+    connected = bool(
+        latest_handshake > 0
+        and handshake_age is not None
+        and handshake_age
+        <= handshake_window
+    )
+
+    rx_bytes, tx_bytes = (
+        transfers.get(
+            (
+                interface_name,
+                public_key,
+            ),
+            (
+                0,
+                0,
+            ),
+        )
+    )
+
+    result.update({
+        'connected': connected,
+
+        'conn_status': (
+            'online'
+            if connected
+            else 'offline'
+        ),
+
+        'connection_status': (
+            'connected'
+            if connected
+            else 'disconnected'
+        ),
+
+        'connection_label': (
+            'Connected'
+            if connected
+            else 'Disconnected'
+        ),
+
+        'conn_reason': (
+            'handshake'
+            if connected
+            else (
+                'stale_handshake'
+                if latest_handshake > 0
+                else 'no_handshake'
+            )
+        ),
+
+        'latest_handshake': (
+            latest_handshake
+        ),
+
+        'latest_handshake_age': (
+            handshake_age
+        ),
+
+        'last_activity_at': (
+            datetime.utcfromtimestamp(
+                latest_handshake
+            ).isoformat()
+            + 'Z'
+            if latest_handshake > 0
+            else None
+        ),
+
+        'rx_bytes': int(
+            rx_bytes
+            or 0
+        ),
+
+        'tx_bytes': int(
+            tx_bytes
+            or 0
+        ),
+    })
+
+    return result
+
 def _subscription_row(sub):
 
     used = int(
@@ -19669,9 +25805,6 @@ def _subscription_row(sub):
     subscription_changed = False
     linked_first_use = []
 
-    # ----------------------------
-    # subscription start time
-    # ----------------------------
     for link in (
         getattr(
             sub,
@@ -19734,9 +25867,6 @@ def _subscription_row(sub):
 
         subscription_changed = True
 
-    # ---------------------------------------------------------
-    # Timer handling
-    # ---------------------------------------------------------
     if subscription_changed:
         if unlimited:
             try:
@@ -19772,9 +25902,6 @@ def _subscription_row(sub):
                 ),
             )
 
-    # ---------------------------------------------------------
-    # Shared data and timer state
-    # ---------------------------------------------------------
     limit = _sub_limit_bytes(
         sub
     )
@@ -19811,9 +25938,6 @@ def _subscription_row(sub):
             'subscription_expired',
         )
 
-    # ---------------------------------------------------------
-    # Attached locations/configs
-    # ---------------------------------------------------------
     locs = []
 
     links = sorted(
@@ -19941,6 +26065,42 @@ def _subscription_row(sub):
             if iface
             else None
         )
+        try:
+            live = _subscription_peer_runtime(
+                peer
+            )
+
+        except Exception:
+            current_app.logger.debug(
+                (
+                    'Could not read subscription runtime '
+                    'for peer_id=%s'
+                ),
+                getattr(
+                    peer,
+                    'id',
+                    '?',
+                ),
+                exc_info=True,
+            )
+
+            live = {
+                'connected': False,
+                'conn_status': 'offline',
+                'connection_status': (
+                    'disconnected'
+                ),
+                'connection_label': (
+                    'Disconnected'
+                ),
+                'conn_reason': (
+                    'runtime_error'
+                ),
+                'latest_handshake': 0,
+                'latest_handshake_age': None,
+                'last_activity_at': None,
+                'runtime_available': False,
+            }
 
         locs.append({
             'link_id': getattr(
@@ -20014,7 +26174,71 @@ def _subscription_row(sub):
                 or ''
             ),
 
-            'status': peer_status,
+                        'status': peer_status,
+
+            'panel_status': (
+                peer_status
+            ),
+
+            'connected': bool(
+                live.get(
+                    'connected'
+                )
+            ),
+
+            'conn_status': (
+                live.get(
+                    'conn_status'
+                )
+                or 'offline'
+            ),
+
+            'connection_status': (
+                live.get(
+                    'connection_status'
+                )
+                or 'disconnected'
+            ),
+
+            'connection_label': (
+                live.get(
+                    'connection_label'
+                )
+                or 'Disconnected'
+            ),
+
+            'conn_reason': (
+                live.get(
+                    'conn_reason'
+                )
+                or 'no_recent_activity'
+            ),
+
+            'latest_handshake': int(
+                live.get(
+                    'latest_handshake'
+                )
+                or 0
+            ),
+
+            'latest_handshake_age': (
+                live.get(
+                    'latest_handshake_age'
+                )
+            ),
+
+            'last_activity_at': (
+                live.get(
+                    'last_activity_at'
+                )
+            ),
+
+            'runtime_available': bool(
+                live.get(
+                    'runtime_available',
+                    True,
+                )
+            ),
 
             'used_bytes': int(
                 getattr(
@@ -20061,9 +26285,181 @@ def _subscription_row(sub):
             ),
         })
 
-    # ---------------------------------------------------------
-    # Final API row
-    # ---------------------------------------------------------
+
+    connected_locations = [
+        location
+        for location in locs
+        if bool(
+            location.get(
+                'connected'
+            )
+        )
+    ]
+
+    runtime_locations = [
+        location
+        for location in locs
+        if bool(
+            location.get(
+                'runtime_available',
+                True,
+            )
+        )
+    ]
+
+    activity_locations = [
+        location
+        for location in locs
+        if int(
+            location.get(
+                'latest_handshake'
+            )
+            or 0
+        ) > 0
+    ]
+
+    active_location = None
+
+    if connected_locations:
+        active_location = max(
+            connected_locations,
+            key=lambda location: int(
+                location.get(
+                    'latest_handshake'
+                )
+                or 0
+            ),
+        )
+
+    elif activity_locations:
+        active_location = max(
+            activity_locations,
+            key=lambda location: int(
+                location.get(
+                    'latest_handshake'
+                )
+                or 0
+            ),
+        )
+
+    connection = {
+        'connected': bool(
+            connected_locations
+        ),
+
+        'status': (
+            'connected'
+            if connected_locations
+            else 'disconnected'
+        ),
+
+        'label': (
+            'Connected'
+            if connected_locations
+            else 'Disconnected'
+        ),
+
+        'connected_count': len(
+            connected_locations
+        ),
+
+        'runtime_count': len(
+            runtime_locations
+        ),
+
+        'total_count': len(
+            locs
+        ),
+
+        'active_peer_id': (
+            (
+                active_location
+                or {}
+            ).get(
+                'peer_id'
+            )
+        ),
+
+        'active_peer_name': (
+            (
+                active_location
+                or {}
+            ).get(
+                'name'
+            )
+            or ''
+        ),
+
+        'active_scope': (
+            (
+                active_location
+                or {}
+            ).get(
+                'scope'
+            )
+            or ''
+        ),
+
+        'active_node_id': (
+            (
+                active_location
+                or {}
+            ).get(
+                'node_id'
+            )
+        ),
+
+        'active_node_name': (
+            (
+                active_location
+                or {}
+            ).get(
+                'node_name'
+            )
+            or ''
+        ),
+
+        'active_iface': (
+            (
+                active_location
+                or {}
+            ).get(
+                'iface'
+            )
+            or ''
+        ),
+
+        'latest_handshake': int(
+            (
+                (
+                    active_location
+                    or {}
+                ).get(
+                    'latest_handshake'
+                )
+                or 0
+            )
+        ),
+
+        'last_activity_at': (
+            (
+                active_location
+                or {}
+            ).get(
+                'last_activity_at'
+            )
+        ),
+
+        'last_activity_age': (
+            (
+                active_location
+                or {}
+            ).get(
+                'latest_handshake_age'
+            )
+        ),
+    }
+
     first_used_at = getattr(
         sub,
         'first_used_at',
@@ -20205,7 +26601,29 @@ def _subscription_row(sub):
             )
         ),
 
-        'runtime_counts': runtime_counts,
+                'runtime_counts': runtime_counts,
+
+        'connection': connection,
+
+        'connected': bool(
+            connection.get(
+                'connected'
+            )
+        ),
+
+        'connection_status': (
+            connection.get(
+                'status'
+            )
+            or 'disconnected'
+        ),
+
+        'connection_label': (
+            connection.get(
+                'label'
+            )
+            or 'Disconnected'
+        ),
 
         'public_url': _sub_public_url(
             sub
@@ -20280,9 +26698,7 @@ def _peer_payload_subscription(sub,target,data,idx=0,total=1,):
     return {
         'name': name,
         'allowed_ips': allowed_ips,
-        # Client-facing server endpoint (exported in the client's [Peer] block).
-        'endpoint': (data.get('endpoint')or '').strip(),
-        # Optional fixed remote-client endpoint for the server's [Peer] block.
+        'endpoint': parse_endpoint_string(data.get('endpoint')),
         'peer_endpoint': (data.get('peer_endpoint')or '').strip(),
         'persistent_keepalive':data.get('persistent_keepalive') or None,
         'mtu':data.get('mtu') or None,
@@ -20306,8 +26722,6 @@ def _create_subscription_peer(target, payload, compensation=None):
     scope = (target.get('scope') or 'local').lower()
     priv = subprocess.check_output(['wg', 'genkey']).strip().decode()
     pub = subprocess.check_output(['wg', 'pubkey'], input=priv.encode()).strip().decode()
-
-    # The server endpoint exported to the client; never the server-side peer endpoint.
     payload = dict(payload)
     peer_endpoint = (payload.pop('peer_endpoint', '') or '').strip()
 
@@ -20327,8 +26741,6 @@ def _create_subscription_peer(target, payload, compensation=None):
             dns=payload.get('dns'),
         )
 
-        # Register before the request: a timeout can be ambiguous even when the
-        # node installed the peer and the panel never received the response.
         if compensation is not None:
             compensation.register_node(node, pub)
 
@@ -20369,9 +26781,6 @@ def _create_subscription_peer(target, payload, compensation=None):
         )
         db.session.add(peer)
         db.session.flush()
-
-        # Installation failures must surface: the caller rolls the whole
-        # subscription transaction back rather than leaving a dead inbound.
         install_local_peer(peer)
         if compensation is not None:
             compensation.register_local(peer)
@@ -20380,7 +26789,6 @@ def _create_subscription_peer(target, payload, compensation=None):
 
 def _attach_subscription_target(sub, target, data, idx=0, total=1, compensation=None):
     if target.get('peer_id'):
-        # Attaching an existing peer: never rekey, readdress or reinstall it.
         peer = db.session.get(Peer, int(target.get('peer_id'))) or abort(404)
         existing = SubscriptionPeer.query.filter_by(peer_id=peer.id).first()
         if existing and existing.subscription_id != sub.id:
@@ -20857,6 +27265,455 @@ def api_subscription_settings():
     saved = _save_subscription_settings(request.get_json(silent=True) or {})
     return jsonify(ok=True, settings=saved)
 
+@app.post('/api/subscriptions/template-preview')
+@require_api_key_or_login
+def api_subscription_template_preview():
+    """
+    Render the real public subscription template for Template Studio.
+
+    Nothing is saved here. The submitted settings exist only for this
+    preview response.
+    """
+
+    payload = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    raw_settings = (
+        payload.get('settings')
+        if isinstance(
+            payload.get('settings'),
+            dict,
+        )
+        else {}
+    )
+
+    subscription_id = payload.get(
+        'subscription_id'
+    )
+
+    sub = None
+
+    if subscription_id not in (
+        None,
+        '',
+        0,
+        '0',
+    ):
+        try:
+            subscription_id = int(
+                subscription_id
+            )
+
+            sub = db.session.get(
+                Subscription,
+                subscription_id,
+            )
+
+        except Exception:
+            sub = None
+
+    if sub is not None:
+        base_settings = (
+            _effective_subscription_settings(
+                sub
+            )
+        )
+    else:
+        base_settings = (
+            _load_subscription_settings()
+        )
+
+    cfg = (
+        _normalize_subscription_settings(
+            raw_settings,
+            base=base_settings,
+        )
+    )
+
+    if sub is not None:
+        preview_sub = sub
+
+        try:
+            preview_data = (
+                _subscription_public_payload(
+                    sub
+                )
+            )
+        except Exception:
+            preview_data = {}
+
+    else:
+        from types import SimpleNamespace
+
+        preview_sub = SimpleNamespace(
+            id=0,
+            name='premium-user',
+            token='preview',
+        )
+
+        gib = 1024 ** 3
+
+        preview_data = {
+            'id': 0,
+            'name': 'premium-user',
+            'token': 'preview',
+
+            'enabled': True,
+            'unlimited': False,
+
+            'limit_bytes': 10 * gib,
+            'used_bytes': int(
+                2.4 * gib
+            ),
+
+            'data_limit_value': 10,
+            'data_limit_unit': 'Gi',
+
+            'start_on_first_use': False,
+
+            'first_used_at': (
+                '2026-08-07T09:30:00Z'
+            ),
+
+            'expires_at': (
+                '2026-08-31T18:00:00Z'
+            ),
+
+            'expires_at_ts': None,
+
+            'ttl_seconds': (
+                12 * 86400
+                + 4 * 3600
+            ),
+
+            'access': {
+                'allowed': True,
+                'reason': '',
+                'message': '',
+                'has_inbounds': True,
+            },
+
+            'locations': [
+                {
+                    'link_id': 1,
+                    'peer_id': 1,
+                    'name': 'Amsterdam',
+                    'status': 'online',
+                    'endpoint': '',
+                    'public_host': '',
+                    'location_label': (
+                        'Netherlands'
+                    ),
+                    'country_code': 'NL',
+                    'flag': '🇳🇱',
+                },
+                {
+                    'link_id': 2,
+                    'peer_id': 2,
+                    'name': 'Frankfurt',
+                    'status': 'online',
+                    'endpoint': '',
+                    'public_host': '',
+                    'location_label': (
+                        'Germany'
+                    ),
+                    'country_code': 'DE',
+                    'flag': '🇩🇪',
+                },
+                {
+                    'link_id': 3,
+                    'peer_id': 3,
+                    'name': 'Backup',
+                    'status': 'offline',
+                    'endpoint': '',
+                    'public_host': '',
+                    'location_label': (
+                        'Netherlands'
+                    ),
+                    'country_code': 'NL',
+                    'flag': '🇳🇱',
+                },
+            ],
+        }
+
+    support = (
+        cfg.get('support')
+        or {}
+    )
+
+    portal_title = (
+        cfg.get('portal_title')
+        or preview_sub.name
+    )
+
+    return render_template(
+        'subscription_public.html',
+
+        preview_mode=True,
+
+        sub=preview_sub,
+        data=preview_data,
+
+        portal_settings=cfg,
+
+        sub_layout=cfg.get(
+            'layout',
+            'aurora',
+        ),
+
+        sub_display_mode=cfg.get(
+            'display_mode',
+            'hybrid',
+        ),
+
+        sub_animation=cfg.get(
+            'animation',
+            'balanced',
+        ),
+
+        sub_background=cfg.get(
+            'background',
+            'aurora',
+        ),
+
+        portal_label=cfg.get(
+            'portal_label',
+            'Secure WireGuard portal',
+        ),
+
+        portal_icon=cfg.get(
+            'portal_icon',
+            'fas fa-bolt',
+        ),
+
+        portal_title=portal_title,
+
+        portal_subtitle=cfg.get(
+            'portal_subtitle',
+            (
+                'Your account is ready. '
+                'Install WireGuard, then '
+                'scan QR or import a config.'
+            ),
+        ),
+
+        support_portal_label=cfg.get(
+            'portal_label',
+            'Secure WireGuard portal',
+        ),
+
+        support_portal_icon=cfg.get(
+            'portal_icon',
+            'fas fa-bolt',
+        ),
+
+        support_portal_title=(
+            portal_title
+        ),
+
+        support_portal_subtitle=cfg.get(
+            'portal_subtitle',
+            (
+                'Your account is ready. '
+                'Install WireGuard, then '
+                'scan QR or import a config.'
+            ),
+        ),
+
+        support_telegram=support.get(
+            'telegram',
+            '',
+        ),
+
+        support_whatsapp=support.get(
+            'whatsapp',
+            '',
+        ),
+
+        support_instagram=support.get(
+            'instagram',
+            '',
+        ),
+
+        support_phone=support.get(
+            'phone',
+            '',
+        ),
+
+        support_website=support.get(
+            'website',
+            '',
+        ),
+
+        support_email=support.get(
+            'email',
+            '',
+        ),
+    )
+
+@app.route(
+    '/api/subscriptions/<int:sid>/portal-settings',
+    methods=[
+        'GET',
+        'POST',
+        'DELETE',
+    ],
+)
+@require_api_key_or_login
+def api_subscription_portal_settings(
+    sid,
+):
+    sub = (
+        db.session.get(
+            Subscription,
+            sid,
+        )
+        or abort(404)
+    )
+
+    store = (
+        _load_subscription_portal_overrides()
+    )
+
+    key = str(
+        sub.id
+    )
+
+    if request.method == 'GET':
+        override = (
+            store.get(key)
+            if isinstance(
+                store.get(key),
+                dict,
+            )
+            else {}
+        )
+
+        return jsonify(
+            ok=True,
+            subscription_id=sub.id,
+            subscription_name=sub.name,
+
+            has_override=bool(
+                override
+            ),
+
+            override=override,
+
+            settings=(
+                _effective_subscription_settings(
+                    sub
+                )
+            ),
+
+            global_settings=(
+                _load_subscription_settings()
+            ),
+        )
+
+    if request.method == 'DELETE':
+        existed = (
+            key in store
+        )
+
+        store.pop(
+            key,
+            None,
+        )
+
+        _save_subscription_portal_overrides(
+            store
+        )
+
+        return jsonify(
+            ok=True,
+            removed=existed,
+            subscription_id=sub.id,
+            settings=(
+                _load_subscription_settings()
+            ),
+        )
+
+    payload = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    global_settings = (
+        _load_subscription_settings()
+    )
+
+    normalized = (
+        _normalize_subscription_settings(
+            payload,
+            base=global_settings,
+        )
+    )
+
+    override = {}
+
+    for field in payload.keys():
+
+        if (
+            field == 'support'
+            and isinstance(
+                payload.get('support'),
+                dict,
+            )
+        ):
+            override['support'] = {
+                support_key: (
+                    normalized[
+                        'support'
+                    ].get(
+                        support_key,
+                        '',
+                    )
+                )
+                for support_key
+                in payload['support'].keys()
+                if support_key
+                in normalized['support']
+            }
+
+        elif (
+            field in normalized
+            and field != 'socials'
+        ):
+            override[
+                field
+            ] = normalized[
+                field
+            ]
+
+    store[
+        key
+    ] = override
+
+    _save_subscription_portal_overrides(
+        store
+    )
+
+    return jsonify(
+        ok=True,
+        subscription_id=sub.id,
+        subscription_name=sub.name,
+        has_override=True,
+        override=override,
+
+        settings=(
+            _effective_subscription_settings(
+                sub
+            )
+        ),
+    )
+
 @app.get('/api/subscriptions/locations')
 @require_api_key_or_login
 def api_subscriptions_locations():
@@ -20897,17 +27754,10 @@ def api_subscriptions_locations():
             'iface_id': iface.id,
             'iface': iface_name,
             'label': iface_name,
-            # The interface's own Address=. It is NOT a client address, so it
-            # is never published under a generic `address` key any more.
             'interface_address': interface_address,
             'server_cidr': interface_address,
             'endpoint': endpoint_value,
             'endpoint_override': endpoint_override,
-            # Same rule as `_endpoint_default_payload`: 'override' when the
-            # operator set one; otherwise 'auto' only if auto-detection (run
-            # above, not deferred) actually produced a value, else 'none' --
-            # detection was attempted and came back empty, which is not the
-            # same claim as "auto-detection will provide it".
             'endpoint_source': (
                 'override' if endpoint_override
                 else ('auto' if endpoint_value else 'none')
@@ -21045,19 +27895,8 @@ def api_subscriptions_locations():
                     ),
 
                     'mtu': item.get('mtu'),
-
-                    # No `_node_endpoint_fallback` call here: that helper can
-                    # make up to two node HTTP calls, and this loop already
-                    # runs once per node interface. An empty 'endpoint' means
-                    # auto-detection decides at export time, same as
-                    # `resolve_client_endpoint_cheap`.
                     'endpoint': endpoint_override,
                     'endpoint_override': endpoint_override,
-                    # Same rule as `_endpoint_default_payload` and the local
-                    # locations above: 'override' when set, else 'auto'.
-                    # Never 'none' here -- detection is deliberately never
-                    # attempted in this loop, so nothing has been
-                    # established that would justify asserting a negative.
                     'endpoint_source': 'override' if endpoint_override else 'auto',
 
                     'available': len(
@@ -21126,11 +27965,6 @@ def api_subscriptions_locations():
 
                     'endpoint': endpoint_override,
                     'endpoint_override': endpoint_override,
-                    # Same rule as the live path above and
-                    # `_endpoint_default_payload`: 'override' when set, else
-                    # 'auto' -- detection is never attempted on this
-                    # (node-unreachable) fallback path either, so 'none'
-                    # would assert a negative that was never checked.
                     'endpoint_source': 'override' if endpoint_override else 'auto',
 
                     'available': len(
@@ -21346,7 +28180,6 @@ def api_subscription_remove_inbound(sid, link_id):
                 ),
             ), 409
 
-        # remove_peer_everywhere also drops the link row in the same transaction.
         try:
             remove_peer_everywhere(peer)
         except PeerRemovalError as e:
@@ -21388,10 +28221,6 @@ def api_subscription_delete(sid):
     deleted, failures = 0, []
 
     for peer in owned:
-        # Capture identifying fields up front: remove_peer_everywhere commits
-        # the row deletion itself, after which `peer` is detached/expired and
-        # reading peer.id / peer.name in the failure branch can raise
-        # DetachedInstanceError (review finding #7).
         peer_id = peer.id
         peer_name = peer.name
         try:
@@ -21406,7 +28235,6 @@ def api_subscription_delete(sid):
                              'detail': str(e)})
 
     if failures:
-        # Keep the subscription so the remaining peers stay reachable for a retry.
         db.session.rollback()
         return jsonify(
             ok=False,
@@ -22054,11 +28882,6 @@ def subscription_access(sub, used_bytes=None) -> dict:
 
 def _subscription_inbound_state(sub):
     """A non-blocking signal for the portal: are there any usable inbounds?
-
-    ``subscription_access`` deliberately does *not* revoke access when this is
-    empty, because the page must still render its explanatory state. The
-    payload exposes it so the UI can show "no configs available" instead of a
-    misleading "Ready" over an empty grid (review finding #3).
     """
     links = getattr(sub, 'links', None) or []
     usable = sum(
@@ -22095,9 +28918,6 @@ def _subscription_public_payload(sub) -> dict:
     locs = []
     dirty = False
 
-    # Usage is needed to decide access. Do that before resolving any public
-    # host or endpoint so a revoked token never triggers or receives topology
-    # discovery as a side effect of rendering its explanatory status page.
     for link in links:
         peer = getattr(link, 'peer', None)
         if not peer:
@@ -22140,10 +28960,6 @@ def _subscription_public_payload(sub) -> dict:
                 link.location_label = label
                 dirty = True
 
-
-        # Go through the shared resolver rather than the local-only fallback:
-        # a node peer stores no endpoint of its own, and `_endpoint_fallback`
-        # would hand out the panel's host with the node interface's listen port.
         endpoint = ''
         if may_disclose_topology and getattr(peer, 'iface', None):
             endpoint = resolve_client_endpoint_cheap(
@@ -22196,92 +29012,208 @@ def _subscription_public_payload(sub) -> dict:
     }
 
 
-def _subscription_settings_public():
-    try:
-        s = _load_subscription_settings()
-    except Exception:
-        s = _subscription_settings_default()
+def _subscription_settings_public(
+    sub=None,
+):
+    settings = (
+        _effective_subscription_settings(
+            sub
+        )
+    )
 
-    socials = s.get('support') or s.get('socials') or {}
+    support = (
+        settings.get('support')
+        or {}
+    )
 
-    layout = str(s.get('layout') or s.get('selected') or 'aurora').strip().lower()
-    if layout not in ('aurora', 'compact', 'cards', 'minimal'):
-        layout = 'aurora'
+    result = dict(
+        settings
+    )
 
-    return {
-        'layout': layout,
-        'display_mode': s.get('display_mode') if s.get('display_mode') in ('bars', 'rings', 'hybrid') else 'hybrid',
-        'animation': s.get('animation') if s.get('animation') in ('rich', 'soft', 'minimal') else 'rich',
-
-        'portal_label': _subscription_text(
-            s.get('portal_label'),
-            'Secure WireGuard portal',
-            80
-        ),
-        'portal_icon': _subscription_portal_icon(
-            s.get('portal_icon')
-        ),
-        'portal_title': _subscription_text(
-            s.get('portal_title'),
+    result[
+        'socials'
+    ] = {
+        'telegram': support.get(
+            'telegram',
             '',
-            90
-        ),
-        'portal_subtitle': _subscription_text(
-            s.get('portal_subtitle'),
-            'Your account is ready. Install WireGuard, then scan QR or import a config.',
-            180
         ),
 
-        'socials': {
-            'telegram': socials.get('telegram', ''),
-            'whatsapp': socials.get('whatsapp', ''),
-            'instagram': socials.get('instagram', ''),
-            'phone': socials.get('phone', ''),
-            'website': socials.get('website', ''),
-            'email': socials.get('email', ''),
-        }
+        'whatsapp': support.get(
+            'whatsapp',
+            '',
+        ),
+
+        'instagram': support.get(
+            'instagram',
+            '',
+        ),
+
+        'phone': support.get(
+            'phone',
+            '',
+        ),
+
+        'website': support.get(
+            'website',
+            '',
+        ),
+
+        'email': support.get(
+            'email',
+            '',
+        ),
     }
 
+    result[
+        'has_override'
+    ] = bool(
+        sub
+        and _subscription_portal_override(
+            sub
+        )
+    )
+
+    return result
 
 @app.get('/s/<token>')
-def subscription_public_page(token):
-    sub = Subscription.query.filter_by(token=token).first() or abort(404)
+def subscription_public_page(
+    token,
+):
+    sub = (
+        Subscription.query
+        .filter_by(
+            token=token
+        )
+        .first()
+        or abort(404)
+    )
 
-    cfg = _subscription_settings_public()
-    socials = cfg['socials']
+    cfg = (
+        _subscription_settings_public(
+            sub
+        )
+    )
 
-    portal_title = cfg.get('portal_title') or sub.name
+    socials = (
+        cfg.get(
+            'socials'
+        )
+        or {}
+    )
+
+    portal_title = (
+        cfg.get(
+            'portal_title'
+        )
+        or sub.name
+    )
 
     return render_template(
         'subscription_public.html',
-        sub=sub,
-        data=_subscription_public_payload(sub),
-        sub_layout=cfg['layout'],
-        sub_display_mode=cfg.get('display_mode', 'hybrid'),
-        sub_animation=cfg.get('animation', 'rich'),
 
-        portal_label=cfg.get('portal_label', 'Secure WireGuard portal'),
-        portal_icon=cfg.get('portal_icon', 'fas fa-bolt'),
+        sub=sub,
+
+        data=(
+            _subscription_public_payload(
+                sub
+            )
+        ),
+
+        portal_settings=cfg,
+
+        sub_layout=cfg.get(
+            'layout',
+            'aurora',
+        ),
+
+        sub_display_mode=cfg.get(
+            'display_mode',
+            'hybrid',
+        ),
+
+        sub_animation=cfg.get(
+            'animation',
+            'balanced',
+        ),
+
+        sub_background=cfg.get(
+            'background',
+            'aurora',
+        ),
+
+        portal_label=cfg.get(
+            'portal_label',
+            'Secure WireGuard portal',
+        ),
+
+        portal_icon=cfg.get(
+            'portal_icon',
+            'fas fa-bolt',
+        ),
+
         portal_title=portal_title,
+
         portal_subtitle=cfg.get(
             'portal_subtitle',
-            'Your account is ready. Install WireGuard, then scan QR or import a config.'
+            (
+                'Your account is ready. '
+                'Install WireGuard, then '
+                'scan QR or import a config.'
+            ),
         ),
 
-        support_portal_label=cfg.get('portal_label', 'Secure WireGuard portal'),
-        support_portal_icon=cfg.get('portal_icon', 'fas fa-bolt'),
-        support_portal_title=portal_title,
+        support_portal_label=cfg.get(
+            'portal_label',
+            'Secure WireGuard portal',
+        ),
+
+        support_portal_icon=cfg.get(
+            'portal_icon',
+            'fas fa-bolt',
+        ),
+
+        support_portal_title=(
+            portal_title
+        ),
+
         support_portal_subtitle=cfg.get(
             'portal_subtitle',
-            'Your account is ready. Install WireGuard, then scan QR or import a config.'
+            (
+                'Your account is ready. '
+                'Install WireGuard, then '
+                'scan QR or import a config.'
+            ),
         ),
 
-        support_telegram=socials.get('telegram', ''),
-        support_whatsapp=socials.get('whatsapp', ''),
-        support_instagram=socials.get('instagram', ''),
-        support_phone=socials.get('phone', ''),
-        support_website=socials.get('website', ''),
-        support_email=socials.get('email', ''),
+        support_telegram=socials.get(
+            'telegram',
+            '',
+        ),
+
+        support_whatsapp=socials.get(
+            'whatsapp',
+            '',
+        ),
+
+        support_instagram=socials.get(
+            'instagram',
+            '',
+        ),
+
+        support_phone=socials.get(
+            'phone',
+            '',
+        ),
+
+        support_website=socials.get(
+            'website',
+            '',
+        ),
+
+        support_email=socials.get(
+            'email',
+            '',
+        ),
     )
 
 @app.get('/s/<token>/api', endpoint='subscription_public_api')
@@ -22299,16 +29231,103 @@ def subscription_public_config(token):
         return revoked
 
     mem = BytesIO()
-    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        for link in sorted(sub.links, key=lambda x: (x.sort_order or 0, x.id or 0)):
-            if not link.peer:
-                continue
-            safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', link.peer.name or f'peer-{link.peer.id}').strip('_')
-            z.writestr(f'{safe or "peer"}.conf', _client_config_txt(link.peer))
-    mem.seek(0)
-    fname = re.sub(r'[^A-Za-z0-9_.-]+', '_', sub.name or 'subscription').strip('_') or 'subscription'
-    return send_file(mem, mimetype='application/zip', as_attachment=True, download_name=f'{fname}.zip')
+    used_names = set()
 
+    with zipfile.ZipFile(
+        mem,
+        'w',
+        zipfile.ZIP_DEFLATED,
+    ) as z:
+
+        for index, link in enumerate(
+            sorted(
+                sub.links,
+                key=lambda x: (
+                    x.sort_order or 0,
+                    x.id or 0,
+                ),
+            ),
+            start=1,
+        ):
+            peer = getattr(link, 'peer', None)
+
+            if not peer:
+                continue
+
+            safe_peer = re.sub(
+                r'[^A-Za-z0-9_.-]+',
+                '_',
+                peer.name or f'peer-{peer.id}',
+            ).strip('._')
+
+            base = safe_peer or f'peer-{peer.id}'
+
+            safe_location = re.sub(
+                r'[^A-Za-z0-9_.-]+',
+                '_',
+                (
+                    getattr(
+                        link,
+                        'location_label',
+                        '',
+                    )
+                    or ''
+                ),
+            ).strip('._')
+
+            if safe_location:
+                candidate = (
+                    f'{base}-{safe_location}'
+                )
+            else:
+                candidate = base
+
+            entry = f'{candidate}.conf'
+
+            normalized = entry.lower()
+
+            if normalized in used_names:
+                entry = (
+                    f'{candidate}-{index}.conf'
+                )
+                normalized = entry.lower()
+
+            if normalized in used_names:
+                entry = (
+                    f'{base}-peer{peer.id}.conf'
+                )
+                normalized = entry.lower()
+
+            suffix = 2
+
+            while normalized in used_names:
+                entry = (
+                    f'{base}-peer{peer.id}-{suffix}.conf'
+                )
+                normalized = entry.lower()
+                suffix += 1
+
+            used_names.add(normalized)
+
+            z.writestr(
+                entry,
+                _client_config_txt(peer),
+            )
+
+    mem.seek(0)
+
+    fname = re.sub(
+        r'[^A-Za-z0-9_.-]+',
+        '_',
+        sub.name or 'subscription',
+    ).strip('._') or 'subscription'
+
+    return send_file(
+        mem,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'{fname}.zip',
+    )
 
 @app.get(
     '/s/<token>/inbound/<int:link_id>/config'
@@ -22394,10 +29413,6 @@ def subscription_public_inbound_qr(token, link_id):
 @app.get('/s/<token>/inbound/<int:link_id>/geo')
 def subscription_public_inbound_geo(token, link_id):
     sub = Subscription.query.filter_by(token=token).first() or abort(404)
-
-    # Geo reveals the public host of an active inbound; gate it behind the
-    # same access check as the config/QR endpoints so a revoked subscription
-    # cannot be probed for live topology (review finding #11).
     revoked = _subscription_access_or_403(sub)
     if revoked:
         return revoked
@@ -22443,6 +29458,1762 @@ _start_retention()
 _start_expiry_enforcer()
 _start_backup_scheduler()
 _node_notify_monitor()
+# ========================================
+# Traffic Control / WG forwarding policy
+# ========================================
+TRAFFIC_POLICY_FILE = os.path.join(INSTANCE_DIR, "traffic_policies.json")
+TRAFFIC_GEO_DIR = os.path.join(INSTANCE_DIR, "traffic_geo")
+TRAFFIC_NFT_TABLE = "wgpanel_traffic"
+TRAFFIC_GEO_MAX_AGE = 86400
+
+
+def _traffic_default_config():
+    return {
+        "enabled": True,
+        "policies": [],
+    }
+
+
+def _traffic_load_config():
+    data = _json_load(TRAFFIC_POLICY_FILE, _traffic_default_config())
+    if not isinstance(data, dict):
+        data = _traffic_default_config()
+    policies = data.get("policies")
+    if not isinstance(policies, list):
+        policies = []
+    return {
+        "enabled": bool(data.get("enabled", True)),
+        "policies": policies,
+    }
+
+
+def _traffic_save_config(data):
+    payload = {
+        "enabled": bool((data or {}).get("enabled", True)),
+        "policies": list((data or {}).get("policies") or []),
+    }
+    _json_save(TRAFFIC_POLICY_FILE, payload)
+    return payload
+
+
+def _traffic_nft_capability():
+    nft = shutil.which("nft")
+    if not nft:
+        return {
+            "available": False,
+            "usable": False,
+            "reason": "not_installed",
+            "detail": "The nft command was not found.",
+        }
+    try:
+        result = subprocess.run(
+            [nft, "list", "ruleset"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if result.returncode == 0:
+            return {
+                "available": True,
+                "usable": True,
+                "reason": "ready",
+                "detail": "nftables is available and the panel can read the ruleset.",
+            }
+        return {
+            "available": True,
+            "usable": False,
+            "reason": "permission_denied",
+            "detail": (result.stderr or result.stdout or "nft list ruleset failed").strip()[:500],
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "usable": False,
+            "reason": "nft_error",
+            "detail": str(exc),
+        }
+
+
+def _traffic_clean_iface(value):
+    value = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", value):
+        raise ValueError("Invalid WireGuard interface name.")
+    return value
+
+
+def _traffic_host_addresses(value):
+    out = []
+    for raw in re.split(r"[\s,]+", str(value or "").strip()):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = ipaddress.ip_interface(raw) if "/" in raw else ipaddress.ip_address(raw)
+            ip_obj = obj.ip if hasattr(obj, "ip") else obj
+            text = str(ip_obj)
+            if text not in out:
+                out.append(text)
+        except Exception:
+            continue
+    return out
+
+
+def _traffic_normalize_destination(raw):
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    try:
+        if "://" in raw:
+            host = urlparse(raw).hostname or ""
+        else:
+            host = raw.split("/", 1)[0]
+            if host.count(":") == 1 and host.rsplit(":", 1)[1].isdigit():
+                host = host.rsplit(":", 1)[0]
+        host = host.strip().strip(".").lower()
+        if host.startswith("*."):
+            host = host[2:]
+        if not host or len(host) > 253:
+            return None
+        if not re.fullmatch(r"[a-z0-9._-]+", host):
+            return None
+        return host
+    except Exception:
+        return None
+
+
+def _traffic_resolve_domains(domains):
+    v4, v6, warnings = set(), set(), []
+    resolved = {}
+    for raw in list(domains or []):
+        host = _traffic_normalize_destination(raw)
+        if not host:
+            warnings.append(f"Invalid domain: {raw}")
+            continue
+        found = []
+        try:
+            for family, _socktype, _proto, _canon, sockaddr in socket.getaddrinfo(host, None):
+                candidate = sockaddr[0]
+                try:
+                    ip_obj = ipaddress.ip_address(candidate)
+                except Exception:
+                    continue
+                if ip_obj.version == 4:
+                    v4.add(str(ip_obj))
+                else:
+                    v6.add(str(ip_obj))
+                if str(ip_obj) not in found:
+                    found.append(str(ip_obj))
+        except Exception as exc:
+            warnings.append(f"Could not resolve {host}: {exc}")
+        resolved[host] = found
+    return v4, v6, resolved, warnings
+
+
+def _traffic_parse_cidrs(values):
+    v4, v6, warnings = set(), set(), []
+    for raw in list(values or []):
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        try:
+            if "/" in raw:
+                net = ipaddress.ip_network(raw, strict=False)
+            else:
+                ip_obj = ipaddress.ip_address(raw)
+                net = ipaddress.ip_network(f"{ip_obj}/{32 if ip_obj.version == 4 else 128}", strict=False)
+            (v4 if net.version == 4 else v6).add(str(net))
+        except Exception:
+            warnings.append(f"Invalid IP/CIDR: {raw}")
+    return v4, v6, warnings
+
+
+def _traffic_geo_cache_path(country, version):
+    os.makedirs(TRAFFIC_GEO_DIR, exist_ok=True)
+    return os.path.join(TRAFFIC_GEO_DIR, f"{country.lower()}-v{version}.zone")
+
+
+def _traffic_geo_url(country, version):
+    cc = country.lower()
+    if version == 4:
+        return f"https://www.ipdeny.com/ipblocks/data/countries/{cc}.zone"
+    return f"https://www.ipdeny.com/ipv6/ipaddresses/blocks/{cc}.zone"
+
+
+def _traffic_geo_networks(country, version, *, force=False):
+    cc = str(country or "").strip().lower()
+    if not re.fullmatch(r"[a-z]{2}", cc):
+        raise ValueError(f"Invalid country code: {country}")
+    path = _traffic_geo_cache_path(cc, version)
+    fresh = False
+    try:
+        fresh = os.path.isfile(path) and (time.time() - os.path.getmtime(path) < TRAFFIC_GEO_MAX_AGE)
+    except Exception:
+        fresh = False
+    if force or not fresh:
+        try:
+            response = requests.get(_traffic_geo_url(cc, version), timeout=12)
+            response.raise_for_status()
+            text_body = response.text
+            valid = []
+            for line in text_body.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    net = ipaddress.ip_network(line, strict=False)
+                    if net.version == version:
+                        valid.append(str(net))
+                except Exception:
+                    continue
+            if not valid:
+                raise ValueError("Downloaded country list was empty or invalid.")
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(valid) + "\n")
+            os.replace(tmp, path)
+        except Exception:
+            if not os.path.isfile(path):
+                raise
+    networks = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                net = ipaddress.ip_network(line, strict=False)
+                if net.version == version:
+                    networks.append(str(net))
+            except Exception:
+                continue
+    return networks
+
+
+def _traffic_set_elements(values):
+    return ", ".join(sorted(set(values)))
+
+
+def _traffic_apply_local(policies):
+    capability = _traffic_nft_capability()
+    if not capability.get("usable"):
+        raise RuntimeError(
+            capability.get("detail")
+            or "nftables is unavailable"
+        )
+
+    nft = shutil.which("nft")
+    if not nft:
+        raise RuntimeError("The nft command was not found.")
+
+    active = [
+        p for p in list(policies or [])
+        if isinstance(p, dict)
+        and p.get("enabled", True)
+    ]
+
+    warnings = []
+    domain_map = {}
+    country_sets = {}
+    policy_data = []
+
+    for p in active:
+        pid = str(
+            p.get("id")
+            or secrets.token_hex(6)
+        )[:32]
+
+        iface = _traffic_clean_iface(
+            p.get("interface")
+        )
+
+        source_mode = str(
+            p.get("source_mode")
+            or "interface"
+        )
+
+        source_ips = (
+            _traffic_host_addresses(
+                p.get("source_ip")
+            )
+            if source_mode == "peer"
+            else []
+        )
+
+        cidr4, cidr6, cidr_warn = (
+            _traffic_parse_cidrs(
+                p.get("cidrs") or []
+            )
+        )
+
+        dom4, dom6, resolved, dom_warn = (
+            _traffic_resolve_domains(
+                p.get("domains") or []
+            )
+        )
+
+        warnings.extend([
+            f"{p.get('name') or pid}: {warning}"
+            for warning in (
+                cidr_warn + dom_warn
+            )
+        ])
+
+        domain_map[pid] = resolved
+
+        direct4 = set(cidr4) | set(dom4)
+        direct6 = set(cidr6) | set(dom6)
+
+        countries = []
+
+        for raw_cc in list(
+            p.get("countries") or []
+        ):
+            cc = str(
+                raw_cc or ""
+            ).strip().lower()
+
+            if not re.fullmatch(
+                r"[a-z]{2}",
+                cc,
+            ):
+                warnings.append(
+                    f"{p.get('name') or pid}: "
+                    f"invalid country code {raw_cc}"
+                )
+                continue
+
+            countries.append(cc)
+
+            if cc not in country_sets:
+                try:
+                    country_sets[cc] = {
+                        4: _traffic_geo_networks(
+                            cc,
+                            4,
+                        ),
+                        6: _traffic_geo_networks(
+                            cc,
+                            6,
+                        ),
+                    }
+
+                except Exception as exc:
+                    warnings.append(
+                        f"Country {cc.upper()}: {exc}"
+                    )
+                    country_sets[cc] = {
+                        4: [],
+                        6: [],
+                    }
+
+        policy_data.append({
+            "id": pid,
+            "name": str(
+                p.get("name")
+                or "Traffic policy"
+            ),
+            "interface": iface,
+            "source_mode": source_mode,
+            "source_ips": source_ips,
+            "direct4": sorted(direct4),
+            "direct6": sorted(direct6),
+            "countries": countries,
+        })
+
+    set_lines = []
+    rule_lines = []
+
+    for cc, versions in sorted(
+        country_sets.items()
+    ):
+        for version, values in (
+            (4, versions.get(4) or []),
+            (6, versions.get(6) or []),
+        ):
+            if not values:
+                continue
+
+            nft_type = (
+                "ipv4_addr"
+                if version == 4
+                else "ipv6_addr"
+            )
+
+            set_name = (
+                f"geo_{cc}_v{version}"
+            )
+
+            set_lines.append(
+                f"  set {set_name} {{ "
+                f"type {nft_type}; "
+                "flags interval; auto-merge; "
+                "elements = { "
+                f"{_traffic_set_elements(values)}"
+                " } }"
+            )
+
+    for row in policy_data:
+        safe_id = (
+            re.sub(
+                r"[^A-Za-z0-9_]",
+                "",
+                row["id"],
+            )[:18]
+            or secrets.token_hex(4)
+        )
+
+        for version, values in (
+            (4, row["direct4"]),
+            (6, row["direct6"]),
+        ):
+            if not values:
+                continue
+
+            nft_type = (
+                "ipv4_addr"
+                if version == 4
+                else "ipv6_addr"
+            )
+
+            set_name = (
+                f"p_{safe_id}_v{version}"
+            )
+
+            set_lines.append(
+                f"  set {set_name} {{ "
+                f"type {nft_type}; "
+                "flags interval; auto-merge; "
+                "elements = { "
+                f"{_traffic_set_elements(values)}"
+                " } }"
+            )
+
+        source_by_version = {
+            4: [],
+            6: [],
+        }
+
+        for src in row["source_ips"]:
+            try:
+                version = (
+                    ipaddress.ip_address(src)
+                    .version
+                )
+                source_by_version[
+                    version
+                ].append(src)
+            except Exception:
+                pass
+
+        for version in (4, 6):
+            family = (
+                "ip"
+                if version == 4
+                else "ip6"
+            )
+
+            source_clause = ""
+
+            if row["source_mode"] == "peer":
+                sources = (
+                    source_by_version[
+                        version
+                    ]
+                )
+
+                if not sources:
+                    warnings.append(
+                        f"{row['name']}: no IPv{version} "
+                        "peer address, so IPv"
+                        f"{version} peer-scoped blocking "
+                        "was skipped"
+                    )
+                    continue
+
+                if len(sources) == 1:
+                    source_clause = (
+                        f" {family} saddr "
+                        f"{sources[0]}"
+                    )
+                else:
+                    source_clause = (
+                        f" {family} saddr {{ "
+                        f"{', '.join(sources)} }}"
+                    )
+
+            base = (
+                f'    iifname "{row["interface"]}"'
+                f"{source_clause}"
+            )
+
+            direct = row[
+                f"direct{version}"
+            ]
+
+            if direct:
+                set_name = (
+                    f"p_{safe_id}_v{version}"
+                )
+
+                rule_lines.append(
+                    f"{base} {family} daddr "
+                    f"@{set_name} counter drop "
+                    f'comment "wgpanel:{safe_id}:'
+                    f'direct:v{version}"'
+                )
+
+            for cc in row["countries"]:
+                if not (
+                    country_sets
+                    .get(cc, {})
+                    .get(version)
+                ):
+                    continue
+
+                rule_lines.append(
+                    f"{base} {family} daddr "
+                    f"@geo_{cc}_v{version} "
+                    "counter drop "
+                    f'comment "wgpanel:{safe_id}:'
+                    f'geo:{cc}:v{version}"'
+                )
+
+    table_exists = (
+        subprocess.run(
+            [
+                nft,
+                "list",
+                "table",
+                "inet",
+                TRAFFIC_NFT_TABLE,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+    lines = []
+
+    if table_exists:
+        lines.append(
+            f"delete table inet "
+            f"{TRAFFIC_NFT_TABLE}"
+        )
+
+    lines.append(
+        f"table inet {TRAFFIC_NFT_TABLE} {{"
+    )
+
+    lines.extend(set_lines)
+
+    lines.extend([
+        "  chain forward {",
+        (
+            "    type filter hook forward "
+            "priority -10; policy accept;"
+        ),
+    ])
+
+    lines.extend(rule_lines)
+
+    lines.extend([
+        "  }",
+        "}",
+    ])
+
+    script = "\n".join(lines) + "\n"
+
+    result = subprocess.run(
+        [nft, "-f", "-"],
+        input=script,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        detail = (
+            result.stderr
+            or result.stdout
+            or "nftables apply failed"
+        ).strip()
+
+        raise RuntimeError(detail)
+
+    return {
+        "ok": True,
+        "policies": len(policy_data),
+        "rules": len(rule_lines),
+        "warnings": warnings,
+        "resolved_domains": domain_map,
+    }
+
+
+def _traffic_local_status():
+    capability = _traffic_nft_capability()
+    result = {
+        "capability": capability,
+        "loaded": False,
+        "counters": {},
+    }
+    if not capability.get("usable"):
+        return result
+    nft = shutil.which("nft")
+    proc = subprocess.run(
+        [nft, "list", "table", "inet", TRAFFIC_NFT_TABLE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return result
+    result["loaded"] = True
+    text_body = proc.stdout or ""
+    for line in text_body.splitlines():
+        m_comment = re.search(r'comment\s+"wgpanel:([^\"]+)"', line)
+        m_counter = re.search(r'counter packets\s+(\d+)\s+bytes\s+(\d+)', line)
+        if m_comment and m_counter:
+            key = m_comment.group(1)
+            result["counters"][key] = {
+                "packets": int(m_counter.group(1)),
+                "bytes": int(m_counter.group(2)),
+            }
+    return result
+
+
+def _traffic_targets_payload():
+    peers_by_iface = {}
+    for peer in Peer.query.order_by(Peer.name.asc()).all():
+        peers_by_iface.setdefault(peer.iface_id, []).append({
+            "id": peer.id,
+            "name": peer.name,
+            "address": peer.address,
+            "public_key": peer.public_key,
+        })
+
+    interfaces = []
+    for iface in InterfaceConfig.query.order_by(InterfaceConfig.node_id.asc().nullsfirst(), InterfaceConfig.name.asc()).all():
+        peers = peers_by_iface.get(iface.id, [])
+        interfaces.append({
+            "id": iface.id,
+            "name": iface.name,
+            "address": iface.address,
+            "node_id": iface.node_id,
+            "node_name": iface.node.name if iface.node else "Local panel",
+            "location": "node" if iface.node_id else "local",
+            "peers": peers,
+        })
+    return interfaces
+
+
+def _traffic_normalize_policy(data):
+    data = data or {}
+    # The id reaches nftables comments and set names, which are fed to
+    # `nft -f -` as root: anything outside this charset could close the quoted
+    # comment and inject rules.
+    policy_id = re.sub(
+        r"[^A-Za-z0-9_-]", "", str(data.get("id") or "")
+    )[:32] or secrets.token_hex(8)
+    name = str(data.get("name") or "Traffic policy").strip()[:80]
+    location = str(data.get("location") or "local").strip().lower()
+    if location not in {"local", "node"}:
+        raise ValueError("location must be local or node")
+    node_id = int(data.get("node_id") or 0) or None
+    iface = _traffic_clean_iface(data.get("interface"))
+    source_mode = str(data.get("source_mode") or "interface").strip().lower()
+    if source_mode not in {"interface", "peer"}:
+        raise ValueError("source_mode must be interface or peer")
+    source_ip = str(data.get("source_ip") or "").strip()
+    if source_mode == "peer" and not _traffic_host_addresses(source_ip):
+        raise ValueError("A peer/source address is required for peer scope.")
+
+    def clean_list(key, max_items=100):
+        raw = data.get(key) or []
+        if isinstance(raw, str):
+            raw = re.split(r"[\n,]+", raw)
+        return [str(x).strip() for x in list(raw) if str(x).strip()][:max_items]
+
+    return {
+        "id": policy_id,
+        "name": name,
+        "enabled": bool(data.get("enabled", True)),
+        "location": location,
+        "node_id": node_id if location == "node" else None,
+        "interface": iface,
+        "source_mode": source_mode,
+        "source_ip": source_ip if source_mode == "peer" else "",
+        "domains": clean_list("domains", 100),
+        "cidrs": clean_list("cidrs", 200),
+        "countries": [x.upper() for x in clean_list("countries", 50)],
+    }
+
+
+@app.get("/api/traffic-control")
+@require_api_key_or_login
+def traffic_control_get():
+    cfg = _traffic_load_config()
+    node_status = {}
+    for node in Node.query.filter(Node.enabled.is_(True)).order_by(Node.id.asc()).all():
+        try:
+            node_status[str(node.id)] = node_get(node, "/api/traffic-control/status", timeout=8) or {}
+        except Exception as exc:
+            node_status[str(node.id)] = {"ok": False, "error": str(exc)}
+    return jsonify(
+        ok=True,
+        enabled=cfg["enabled"],
+        policies=cfg["policies"],
+        targets=_traffic_targets_payload(),
+        local=_traffic_local_status(),
+        nodes=node_status,
+        geo_provider="IPdeny",
+        domain_mode="resolved_ip",
+    )
+
+@app.post("/api/traffic-control")
+@require_api_key_or_login
+def traffic_control_save():
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    try:
+        previous = _traffic_load_config()
+
+        raw_policies = (
+            data.get("policies")
+            or []
+        )
+
+        if not isinstance(
+            raw_policies,
+            list,
+        ):
+            raise ValueError(
+                "policies must be a list"
+            )
+
+        policies = [
+            _traffic_normalize_policy(
+                item
+            )
+            for item in raw_policies
+        ]
+
+        seen = set()
+
+        for policy in policies:
+            if policy["id"] in seen:
+                raise ValueError(
+                    "Duplicate policy id: "
+                    f"{policy['id']}"
+                )
+
+            seen.add(
+                policy["id"]
+            )
+
+        enabled = bool(
+            data.get(
+                "enabled",
+                True,
+            )
+        )
+
+        cfg = _traffic_save_config({
+            "enabled": enabled,
+            "policies": policies,
+        })
+
+        previous_enabled = bool(
+            previous.get(
+                "enabled",
+                True,
+            )
+        )
+
+        previous_policies = (
+            previous.get("policies")
+            if isinstance(
+                previous,
+                dict,
+            )
+            else []
+        ) or []
+
+        changed = bool(
+            previous_enabled != enabled
+            or previous_policies != policies
+        )
+
+        if changed:
+            local_count = sum(
+                1
+                for policy in policies
+                if policy.get(
+                    "location"
+                ) == "local"
+            )
+
+            node_count = sum(
+                1
+                for policy in policies
+                if policy.get(
+                    "location"
+                ) == "node"
+            )
+
+            active_count = sum(
+                1
+                for policy in policies
+                if policy.get(
+                    "enabled",
+                    True,
+                )
+            )
+
+            _send_telegram_event(
+                "traffic_policy_change",
+                (
+                    "Traffic Control "
+                    "policy changed"
+                ),
+                status=(
+                    "Enabled"
+                    if enabled
+                    else "Disabled"
+                ),
+                details=[
+                    (
+                        "Policies",
+                        len(policies),
+                    ),
+                    (
+                        "Active policies",
+                        active_count,
+                    ),
+                    (
+                        "Local policies",
+                        local_count,
+                    ),
+                    (
+                        "Node policies",
+                        node_count,
+                    ),
+                ],
+                dedupe_key=(
+                    "traffic-policy:"
+                    f"{int(enabled)}:"
+                    f"{len(policies)}:"
+                    f"{active_count}"
+                ),
+                dedupe_seconds=2,
+            )
+
+        return jsonify(
+            ok=True,
+            **cfg,
+        )
+
+    except ValueError as exc:
+        return jsonify(
+            ok=False,
+            error="invalid_policy",
+            detail=str(exc),
+        ), 400
+
+
+@app.post("/api/traffic-control/apply")
+@require_api_key_or_login
+def traffic_control_apply():
+    cfg = _traffic_load_config()
+
+    policies = (
+        cfg["policies"]
+        if cfg.get("enabled", True)
+        else []
+    )
+
+    local_policies = [
+        p for p in policies
+        if p.get("location") == "local"
+    ]
+
+    node_groups = {}
+
+    for p in policies:
+        if p.get("location") != "node":
+            continue
+
+        nid = int(
+            p.get("node_id") or 0
+        )
+
+        if nid:
+            node_groups.setdefault(
+                nid,
+                [],
+            ).append(p)
+
+    result = {
+        "local": None,
+        "nodes": {},
+        "warnings": [],
+    }
+
+    errors = []
+
+    try:
+        result["local"] = (
+            _traffic_apply_local(
+                local_policies
+            )
+        )
+
+        result["warnings"].extend(
+            (result["local"] or {})
+            .get("warnings")
+            or []
+        )
+
+    except Exception as exc:
+        detail = str(exc).strip()
+
+        result["local"] = {
+            "ok": False,
+            "error": detail,
+        }
+
+        errors.append(
+            f"Local panel: {detail}"
+        )
+
+        current_app.logger.exception(
+            "Local Traffic Control apply failed"
+        )
+
+    for nid, rows in node_groups.items():
+        node = db.session.get(
+            Node,
+            nid,
+        )
+
+        if not node or not node.enabled:
+            detail = (
+                "node_not_found_or_disabled"
+            )
+
+            result["nodes"][str(nid)] = {
+                "ok": False,
+                "error": detail,
+            }
+
+            errors.append(
+                f"Node {nid}: {detail}"
+            )
+            continue
+
+        try:
+            remote = (
+                node_post(
+                    node,
+                    "/api/traffic-control/apply",
+                    {"policies": rows},
+                    timeout=45,
+                )
+                or {}
+            )
+
+            result["nodes"][
+                str(nid)
+            ] = remote
+
+            result["warnings"].extend(
+                remote.get("warnings")
+                or []
+            )
+
+            if not remote.get("ok"):
+                detail = str(
+                    remote.get("detail")
+                    or remote.get("error")
+                    or "remote apply failed"
+                ).strip()
+
+                errors.append(
+                    f"{node.name or ('Node ' + str(nid))}: "
+                    f"{detail}"
+                )
+
+        except Exception as exc:
+            detail = str(exc).strip()
+
+            result["nodes"][
+                str(nid)
+            ] = {
+                "ok": False,
+                "error": detail,
+            }
+
+            errors.append(
+                f"{node.name or ('Node ' + str(nid))}: "
+                f"{detail}"
+            )
+
+            current_app.logger.exception(
+                "Node Traffic Control apply failed: node=%s",
+                nid,
+            )
+
+    local_ok = bool(
+        (result.get("local") or {})
+        .get("ok")
+    )
+
+    nodes_ok = (
+        all(
+            bool(value.get("ok"))
+            for value in result[
+                "nodes"
+            ].values()
+        )
+        if result["nodes"]
+        else True
+    )
+
+    ok = bool(
+        local_ok
+        and nodes_ok
+    )
+
+    response = {
+        "ok": ok,
+        **result,
+    }
+
+    if errors:
+        response["detail"] = (
+        " | ".join(
+            errors
+        )[:1800]
+    )
+
+    active_policy_count = len(
+        policies
+    )
+
+    local_policy_count = len(
+        local_policies
+    )
+
+    node_policy_count = sum(
+        len(rows)
+        for rows in (
+            node_groups.values()
+        )
+    )
+
+    if ok:
+        _send_telegram_event(
+            "traffic_apply_success",
+            (
+                "Traffic Control "
+                "rules applied"
+            ),
+            status="Active",
+            details=[
+                (
+                    "Policies",
+                    active_policy_count,
+                ),
+                (
+                    "Local policies",
+                    local_policy_count,
+                ),
+                (
+                    "Node policies",
+                    node_policy_count,
+                ),
+                (
+                    "Nodes",
+                    len(node_groups),
+                ),
+                (
+                    "Warnings",
+                    len(
+                        result.get(
+                            "warnings"
+                        )
+                        or []
+                    ),
+                ),
+            ],
+            dedupe_key=(
+                "traffic-apply-success:"
+                f"{active_policy_count}:"
+                f"{len(node_groups)}"
+            ),
+            dedupe_seconds=5,
+        )  
+
+    else:
+        _send_telegram_event(
+            "traffic_apply_failed",
+            (
+                "Traffic Control "
+                "apply failed"
+            ),
+            status="Failed",
+            details=[
+                (
+                    "Policies",
+                    active_policy_count,
+                ),
+                (
+                    "Local policies",
+                    local_policy_count,
+                ),
+                (
+                    "Node policies",
+                    node_policy_count,
+                ),
+                (
+                    "Nodes",
+                    len(node_groups),
+                ),
+                (
+                    "Error",
+                    response.get(
+                        "detail"
+                    )
+                    or (
+                        "Traffic Control "
+                        "could not be applied."
+                    ),
+                ),
+            ],
+            dedupe_key=(
+                "traffic-apply-failed:"
+                + str(
+                    response.get(
+                        "detail"
+                    )
+                    or "unknown"
+                )[:180]
+            ),
+            dedupe_seconds=60,
+        )
+
+    return jsonify(
+        **response
+    ), (
+        200
+        if ok
+        else 502
+    )
+
+@app.get("/api/traffic-control/status")
+@login_required
+def traffic_control_status():
+    return jsonify(ok=True, **_traffic_local_status())
+
+def _traffic_nft_set_text(set_name):
+    nft = shutil.which("nft")
+    if not nft:
+        return ""
+    proc = subprocess.run(
+        [nft, "list", "set", "inet", TRAFFIC_NFT_TABLE, str(set_name)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _traffic_test_policy_local(policy):
+    policy = dict(policy or {})
+    pid = str(policy.get("id") or "").strip()
+    name = str(policy.get("name") or "Traffic policy").strip()
+    iface = _traffic_clean_iface(policy.get("interface"))
+    source_mode = str(policy.get("source_mode") or "interface").strip().lower()
+    source_ips = _traffic_host_addresses(policy.get("source_ip")) if source_mode == "peer" else []
+    checks = []
+
+    def add(key, label, status, detail):
+        checks.append({
+            "key": key,
+            "label": label,
+            "status": status,
+            "detail": str(detail or ""),
+        })
+
+    capability = _traffic_nft_capability()
+    if not capability.get("usable"):
+        add("nftables", "nftables engine", "fail", capability.get("detail") or "nftables is unavailable.")
+        return {
+            "ok": False,
+            "policy_id": pid,
+            "policy_name": name,
+            "checks": checks,
+            "counters": {"packets": 0, "bytes": 0},
+        }
+
+    nft = shutil.which("nft")
+    table_proc = subprocess.run(
+        [nft, "list", "table", "inet", TRAFFIC_NFT_TABLE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    table_text = table_proc.stdout or ""
+    if table_proc.returncode != 0:
+        add("table", "Live policy table", "fail", "inet wgpanel_traffic is not loaded. Re-apply the policy rules.")
+        return {
+            "ok": False,
+            "policy_id": pid,
+            "policy_name": name,
+            "checks": checks,
+            "counters": {"packets": 0, "bytes": 0},
+        }
+    add("table", "Live policy table", "pass", "inet wgpanel_traffic is loaded in the kernel.")
+
+    iface_proc = subprocess.run(
+        ["wg", "show", iface],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=False,
+    )
+    add(
+        "interface",
+        "WireGuard interface",
+        "pass" if iface_proc.returncode == 0 else "fail",
+        f"{iface} is active." if iface_proc.returncode == 0 else f"{iface} is not active in the WireGuard runtime.",
+    )
+
+    versions = {4, 6}
+    if source_mode == "peer":
+        versions = set()
+        for src in source_ips:
+            try:
+                versions.add(ipaddress.ip_address(src).version)
+            except Exception:
+                pass
+        if source_ips:
+            add("scope", "Peer source scope", "pass", f"Live policy is expected to match only {', '.join(source_ips)} on {iface}.")
+        else:
+            add("scope", "Peer source scope", "fail", "The policy has no usable peer/source address.")
+
+    safe_id = re.sub(r"[^A-Za-z0-9_]", "", pid)[:18]
+    configured_domains = list(policy.get("domains") or [])
+    configured_cidrs = list(policy.get("cidrs") or [])
+    configured_countries = [str(x or "").strip().lower() for x in list(policy.get("countries") or []) if str(x or "").strip()]
+
+    def rule_line(comment):
+        marker = f'comment "{comment}"'
+        for line in table_text.splitlines():
+            if marker in line:
+                return line.strip()
+        return ""
+
+    def scope_matches(line, version):
+        if not line or f'iifname "{iface}"' not in line:
+            return False
+        if source_mode != "peer":
+            return True
+        family = "ip" if version == 4 else "ip6"
+        candidates = [s for s in source_ips if ipaddress.ip_address(s).version == version]
+        return bool(candidates) and all((f"{family} saddr {s}" in line) or (s in line and f"{family} saddr" in line) for s in candidates)
+
+    direct_needed = bool(configured_domains or configured_cidrs)
+    for version in (4, 6):
+        if version not in versions:
+            if direct_needed:
+                add(f"direct_v{version}", f"IPv{version} direct rule", "info", f"Skipped because this peer has no IPv{version} WireGuard source address.")
+            continue
+        if not direct_needed:
+            continue
+        comment = f"wgpanel:{pid}:direct:v{version}"
+        line = rule_line(comment)
+        set_name = f"p_{safe_id}_v{version}"
+        set_text = _traffic_nft_set_text(set_name)
+        if line and scope_matches(line, version) and set_text:
+            add(f"direct_v{version}", f"IPv{version} domain/IP rule", "pass", f"DROP rule and @{set_name} are loaded with the expected {iface} scope.")
+        else:
+            add(f"direct_v{version}", f"IPv{version} domain/IP rule", "fail", "The expected live DROP rule or destination set is missing. Save & apply again.")
+
+    if configured_domains:
+        dom4, dom6, resolved, warnings = _traffic_resolve_domains(configured_domains)
+        for warning in warnings:
+            add("domain_dns", "Domain resolution", "warn", warning)
+        for version, values in ((4, sorted(dom4)), (6, sorted(dom6))):
+            if version not in versions:
+                continue
+            if not values:
+                continue
+            set_name = f"p_{safe_id}_v{version}"
+            set_text = _traffic_nft_set_text(set_name)
+            present = [ip for ip in values if ip in set_text]
+            missing = [ip for ip in values if ip not in set_text]
+            if present and not missing:
+                add(f"domain_v{version}", f"IPv{version} domain addresses", "pass", f"Current DNS addresses are present in the live set: {', '.join(present[:4])}{'…' if len(present) > 4 else ''}")
+            elif present:
+                add(f"domain_v{version}", f"IPv{version} domain addresses", "warn", f"DNS changed partially. {len(present)} current address(es) are loaded and {len(missing)} are not. Re-apply the policy.")
+            else:
+                add(f"domain_v{version}", f"IPv{version} domain addresses", "fail", "Current DNS addresses are not in the live set. The domain changed since the last apply; refresh the live policy rules.")
+
+    for cc in configured_countries:
+        if not re.fullmatch(r"[a-z]{2}", cc):
+            add(f"geo_{cc}", "Geo country", "fail", f"Invalid country code: {cc}")
+            continue
+        for version in (4, 6):
+            if version not in versions:
+                continue
+            set_name = f"geo_{cc}_v{version}"
+            set_text = _traffic_nft_set_text(set_name)
+            comment = f"wgpanel:{pid}:geo:{cc}:v{version}"
+            line = rule_line(comment)
+            if set_text and line and scope_matches(line, version):
+                add(f"geo_{cc}_v{version}", f"{cc.upper()} Geo IPv{version}", "pass", f"@{set_name} and its scoped DROP rule are loaded.")
+            else:
+                add(f"geo_{cc}_v{version}", f"{cc.upper()} Geo IPv{version}", "fail", "The country set or its scoped DROP rule is missing.")
+
+    status = _traffic_local_status()
+    packets = 0
+    byte_count = 0
+    for key, counter in (status.get("counters") or {}).items():
+        if str(key).startswith(pid + ":"):
+            packets += int((counter or {}).get("packets") or 0)
+            byte_count += int((counter or {}).get("bytes") or 0)
+    add(
+        "counters",
+        "Live hit counters",
+        "pass" if packets > 0 else "info",
+        f"This policy has blocked {packets} packet(s) / {byte_count} byte(s)." if packets > 0 else "Rules are loaded but no real forwarded packet has matched them yet.",
+    )
+
+    if not (configured_domains or configured_cidrs or configured_countries):
+        add("destinations", "Policy destinations", "fail", "The policy has no domains, IP/CIDR entries, or countries to block.")
+
+    overall = not any(row.get("status") == "fail" for row in checks)
+    return {
+        "ok": overall,
+        "policy_id": pid,
+        "policy_name": name,
+        "checks": checks,
+        "counters": {"packets": packets, "bytes": byte_count},
+    }
+
+
+@app.post("/api/traffic-control/test")
+@login_required
+def traffic_control_test():
+    data = request.get_json(silent=True) or {}
+    policy_id = str(data.get("policy_id") or "").strip()
+    if not policy_id:
+        return jsonify(ok=False, error="policy_id_required", detail="policy_id is required."), 400
+
+    cfg = _traffic_load_config()
+    policy = next((p for p in cfg.get("policies", []) if str((p or {}).get("id") or "") == policy_id), None)
+    if not policy:
+        return jsonify(ok=False, error="policy_not_found", detail="The saved traffic policy was not found."), 404
+    if policy.get("enabled", True) is False:
+        return jsonify(ok=False, error="policy_disabled", detail="The policy is disabled and is intentionally not loaded."), 409
+
+    if policy.get("location") == "node":
+        node_id = int(policy.get("node_id") or 0)
+        node = db.session.get(Node, node_id)
+        if not node or not node.enabled:
+            return jsonify(ok=False, error="node_not_found_or_disabled", detail="The policy node is missing or disabled."), 404
+        try:
+            result = node_post(node, "/api/traffic-control/test", {"policy": policy}, timeout=20) or {}
+            return jsonify(result), 200
+        except Exception as exc:
+            return jsonify(ok=False, error="node_test_failed", detail=str(exc)), 502
+
+    try:
+        result = _traffic_test_policy_local(policy)
+        return jsonify(result), 200
+    except Exception as exc:
+        current_app.logger.exception("Traffic policy test failed")
+        return jsonify(ok=False, error="traffic_test_failed", detail=str(exc)), 500
+
+def _traffic_live_set_contains(set_name, address):
+    """
+    Return True when *address* is covered by a live nftables set.
+
+    Exact addresses are checked directly through nftables first.
+    The fallback parser handles CIDRs / interval Geo sets and works
+    with both one-line and multiline `nft list set` output.
+    """
+    try:
+        wanted = ipaddress.ip_address(
+            str(address or '').strip()
+        )
+    except Exception:
+        return False
+
+    clean_set_name = str(
+        set_name or ''
+    ).strip()
+
+    if not re.fullmatch(
+        r'[A-Za-z0-9_.:-]{1,128}',
+        clean_set_name,
+    ):
+        return False
+
+    nft = shutil.which("nft")
+
+    if nft:
+        try:
+            script = (
+                f"get element inet "
+                f"{TRAFFIC_NFT_TABLE} "
+                f"{clean_set_name} "
+                f"{{ {wanted} }}\n"
+            )
+
+            result = subprocess.run(
+                [nft, "-f", "-"],
+                input=script,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+
+            if result.returncode == 0:
+                return True
+
+        except Exception:
+            pass
+
+    text_body = _traffic_nft_set_text(
+        clean_set_name
+    )
+
+    if not text_body:
+        return False
+
+    match = re.search(
+        r'elements\s*=\s*\{(.*?)\}',
+        text_body,
+        re.S,
+    )
+
+    if not match:
+        return False
+
+    for raw_token in match.group(1).split(','):
+        token = ' '.join(
+            raw_token.strip().split()
+        )
+
+        if not token:
+            continue
+
+        try:
+            if (
+                '-' in token
+                and '/' not in token
+            ):
+                first, last = [
+                    part.strip()
+                    for part in token.split(
+                        '-',
+                        1,
+                    )
+                ]
+
+                start_ip = ipaddress.ip_address(
+                    first
+                )
+                end_ip = ipaddress.ip_address(
+                    last
+                )
+
+                if (
+                    start_ip.version
+                    == wanted.version
+                    and int(start_ip)
+                    <= int(wanted)
+                    <= int(end_ip)
+                ):
+                    return True
+
+                continue
+
+            if '/' in token:
+                network = ipaddress.ip_network(
+                    token,
+                    strict=False,
+                )
+
+                if (
+                    network.version
+                    == wanted.version
+                    and wanted in network
+                ):
+                    return True
+
+                continue
+
+            if (
+                ipaddress.ip_address(token)
+                == wanted
+            ):
+                return True
+
+        except Exception:
+            continue
+
+    return False
+
+
+def _traffic_manual_target_addresses(target):
+    raw = str(target or '').strip()
+    if not raw:
+        raise ValueError('Enter a domain, URL, IPv4 or IPv6 address.')
+
+    candidate = raw.strip('[]')
+    try:
+        return raw, '', [str(ipaddress.ip_address(candidate))]
+    except Exception:
+        pass
+
+    host = _traffic_normalize_destination(raw)
+    if not host:
+        raise ValueError('The destination is not a valid domain, URL, IPv4 or IPv6 address.')
+
+    found = []
+    try:
+        for _family, _socktype, _proto, _canon, sockaddr in socket.getaddrinfo(host, None):
+            if not sockaddr:
+                continue
+            try:
+                value = str(ipaddress.ip_address(sockaddr[0]))
+            except Exception:
+                continue
+            if value not in found:
+                found.append(value)
+    except Exception as exc:
+        raise ValueError(f'Could not resolve {host}: {exc}') from exc
+
+    if not found:
+        raise ValueError(f'{host} did not resolve to a usable IP address.')
+
+    return raw, host, found
+
+
+def _traffic_manual_test_local(policy, target):
+    policy = dict(policy or {})
+    pid = str(policy.get('id') or '').strip()
+    iface = _traffic_clean_iface(policy.get('interface'))
+    source_mode = str(policy.get('source_mode') or 'interface').strip().lower()
+    source_ips = _traffic_host_addresses(policy.get('source_ip')) if source_mode == 'peer' else []
+
+    capability = _traffic_nft_capability()
+    if not capability.get('usable'):
+        raise RuntimeError(capability.get('detail') or 'nftables is unavailable.')
+
+    nft = shutil.which('nft')
+    table_proc = subprocess.run(
+        [nft, 'list', 'table', 'inet', TRAFFIC_NFT_TABLE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if table_proc.returncode != 0:
+        raise RuntimeError('inet wgpanel_traffic is not loaded. Re-apply the policy rules.')
+    table_text = table_proc.stdout or ''
+
+    original_target, hostname, addresses = _traffic_manual_target_addresses(target)
+    safe_id = re.sub(r'[^A-Za-z0-9_]', '', pid)[:18]
+    countries = [
+        str(value or '').strip().lower()
+        for value in list(policy.get('countries') or [])
+        if re.fullmatch(r'[A-Za-z]{2}', str(value or '').strip())
+    ]
+
+    source_versions = {4, 6}
+    if source_mode == 'peer':
+        source_versions = set()
+        for source in source_ips:
+            try:
+                source_versions.add(ipaddress.ip_address(source).version)
+            except Exception:
+                pass
+
+    def rule_line(comment):
+        marker = f'comment "{comment}"'
+        for line in table_text.splitlines():
+            if marker in line:
+                return line.strip()
+        return ''
+
+    def scoped_rule_exists(comment, version):
+        line = rule_line(comment)
+        if not line or f'iifname "{iface}"' not in line:
+            return False
+        if source_mode != 'peer':
+            return True
+        family = 'ip' if version == 4 else 'ip6'
+        candidates = []
+        for source in source_ips:
+            try:
+                if ipaddress.ip_address(source).version == version:
+                    candidates.append(source)
+            except Exception:
+                pass
+        return bool(candidates) and all(source in line and f'{family} saddr' in line for source in candidates)
+
+    results = []
+    for address in addresses:
+        ip_obj = ipaddress.ip_address(address)
+        version = ip_obj.version
+        applicable = version in source_versions
+        matches = []
+
+        if applicable:
+            direct_set = f'p_{safe_id}_v{version}'
+            direct_comment = f'wgpanel:{pid}:direct:v{version}'
+            if (
+                _traffic_live_set_contains(direct_set, address)
+                and scoped_rule_exists(direct_comment, version)
+            ):
+                matches.append({
+                    'kind': 'direct',
+                    'label': 'Domain/IP set',
+                    'set': direct_set,
+                    'comment': direct_comment,
+                })
+
+            for cc in countries:
+                geo_set = f'geo_{cc}_v{version}'
+                geo_comment = f'wgpanel:{pid}:geo:{cc}:v{version}'
+                if (
+                    _traffic_live_set_contains(geo_set, address)
+                    and scoped_rule_exists(geo_comment, version)
+                ):
+                    matches.append({
+                        'kind': 'geo',
+                        'label': f'Geo {cc.upper()}',
+                        'set': geo_set,
+                        'comment': geo_comment,
+                    })
+
+        results.append({
+            'ip': address,
+            'version': version,
+            'applicable': applicable,
+            'blocked': bool(applicable and matches),
+            'matches': matches,
+            'note': (
+                '' if applicable
+                else f'This peer has no IPv{version} WireGuard source address.'
+            ),
+        })
+
+    applicable_rows = [row for row in results if row.get('applicable')]
+    blocked_rows = [row for row in applicable_rows if row.get('blocked')]
+
+    if not applicable_rows:
+        verdict = 'not_applicable'
+    elif len(blocked_rows) == len(applicable_rows):
+        verdict = 'blocked'
+    elif blocked_rows:
+        verdict = 'partial'
+    else:
+        verdict = 'not_blocked'
+
+    scope = (
+        f'{iface} · peer source {", ".join(source_ips)}'
+        if source_mode == 'peer'
+        else f'{iface} · entire interface'
+    )
+
+    return {
+        'ok': True,
+        'policy_id': pid,
+        'policy_name': str(policy.get('name') or 'Traffic policy'),
+        'target': original_target,
+        'hostname': hostname,
+        'resolved': addresses,
+        'verdict': verdict,
+        'scope': scope,
+        'results': results,
+        'note': (
+            'This evaluates the live nftables sets and exact scoped DROP rules. '
+            'It does not generate traffic as the WireGuard peer.'
+        ),
+    }
+
+
+@app.post('/api/traffic-control/test-destination')
+@require_api_key_or_login
+def traffic_control_test_destination():
+    data = request.get_json(silent=True) or {}
+    policy_id = str(data.get('policy_id') or '').strip()
+    target = str(data.get('target') or '').strip()
+
+    if not policy_id:
+        return jsonify(ok=False, error='policy_id_required', detail='policy_id is required.'), 400
+    if not target:
+        return jsonify(ok=False, error='target_required', detail='Enter a domain, URL, IPv4 or IPv6 address.'), 400
+
+    cfg = _traffic_load_config()
+    policy = next(
+        (
+            row for row in cfg.get('policies', [])
+            if str((row or {}).get('id') or '') == policy_id
+        ),
+        None,
+    )
+    if not policy:
+        return jsonify(ok=False, error='policy_not_found', detail='The saved traffic policy was not found.'), 404
+    if policy.get('enabled', True) is False:
+        return jsonify(ok=False, error='policy_disabled', detail='The policy is disabled and is not loaded into nftables.'), 409
+
+    if policy.get('location') == 'node':
+        node_id = int(policy.get('node_id') or 0)
+        node = db.session.get(Node, node_id)
+        if not node or not node.enabled:
+            return jsonify(ok=False, error='node_not_found_or_disabled', detail='The policy node is missing or disabled.'), 404
+        try:
+            result = node_post(
+                node,
+                '/api/traffic-control/test-destination',
+                {'policy': policy, 'target': target},
+                timeout=20,
+            ) or {}
+            return jsonify(result), 200
+        except Exception as exc:
+            return jsonify(ok=False, error='node_destination_test_failed', detail=str(exc)), 502
+
+    try:
+        return jsonify(_traffic_manual_test_local(policy, target))
+    except ValueError as exc:
+        return jsonify(ok=False, error='invalid_target', detail=str(exc)), 400
+    except Exception as exc:
+        current_app.logger.exception('Traffic destination test failed')
+        return jsonify(ok=False, error='traffic_destination_test_failed', detail=str(exc)), 500
+
 
 if __name__ == "__main__":
 
@@ -22627,16 +31398,11 @@ if __name__ == "__main__":
     try:
         bootstrap()
     except SchemaMigrationError as e:
-        # A half-migrated database must not serve traffic: peer queries would
-        # fail against the missing columns while the panel still answered as
-        # though it were healthy.
         app.logger.critical(
             "Refusing to start: the database schema could not be migrated: %s", e
         )
         raise SystemExit(1)
     except Exception as e:
-        # Interface discovery and the boot-time housekeeping below the schema
-        # step are best-effort; the panel is still usable without them.
         app.logger.exception("bootstrap failed: %s", e)
 
     _Guni(app, options).run()
